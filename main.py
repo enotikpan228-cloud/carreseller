@@ -2624,7 +2624,7 @@ async def build_businesses_text(user_id):
         "Здесь находятся твои автомобильные бизнесы.\n\n"
         f"🏢 Автосалон: {'✅ открыт' if dealership else '❌ не открыт'}\n"
         f"🔧 СТО: {'✅ инвестировано ' + format(sto_invested, ',').replace(',', ' ') + ' ₽' if sto_invested else '❌ нет инвестиций'}\n"
-        f"🛠 Мастерская: {'✅ ' + workshop_name + f' · ур. {int(workshop["level"])}' if workshop else '❌ не открыта'}\n"
+        f"⚒️ Мастерская: {'✅ ' + workshop_name + ' · ур. ' + str(int(workshop['level'])) if workshop else '❌ Не открыта'}\n"
         f"🏎️ Полигон: {'✅ ур. ' + str(track_level) if track_level else '❌ не открыт'}\n"
         "🔧 Техосмотр: ✅ доступен\n"
         f"🏭 Бизнес-недвижимость: <b>{len(business_properties)}</b>\n"
