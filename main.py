@@ -311,6 +311,9 @@ LIMITED_CARS = [
     },
 ]
 LIMITED_CARS_BY_KEY = {car["key"]: car for car in LIMITED_CARS}
+# Chance 0.0001 = 0.01% (1 in 10,000) for each eligible source roll.
+LIMITED_SPAWN_CHANCE = 0.0001
+LIMITED_STOCK_CACHE = {car["key"]: int(car["stock"]) for car in LIMITED_CARS}
 
 
 # =========================================================
@@ -866,6 +869,11 @@ PLATE_TYPES = {
         "feature": "Игровая серия ЭКО для электрического транспорта",
         "effect": "Не даёт бонуса к расчётной цене, но подходит для коллекции электротранспорта.",
     },
+    "exclusive": {
+        "name": "💎 Эксклюзивный EX", "multiplier": 1.75, "price": 2_500_000, "weight": 0,
+        "feature": "Уникальная серия EX, выдаваемая только вместе с лимитированным автомобилем",
+        "effect": "Повышает расчёт предложений NPC за автомобиль на 75%; навсегда привязана к лимитированному экземпляру.",
+    },
 }
 
 PLATE_LETTERS = "АВЕКМНОРСТУХ"
@@ -886,6 +894,8 @@ def generate_plate_number(plate_type):
     special_region = rng.choice(PLATE_SPECIAL_REGIONS)
     a, b, c = rng.choices(PLATE_LETTERS, k=3)
 
+    if plate_type == "exclusive":
+        return f"EX {rng.randint(100000, 999999)}"
     if plate_type == "government":
         series = rng.choice(PLATE_GOVERNMENT_SERIES)
         digits = rng.choice([f"{n:03d}" for n in (1, 7, 10, 111, 222, 333, 555, 777, 888, 999)])
@@ -1097,9 +1107,14 @@ async def init_db():
                 rounds INTEGER NOT NULL DEFAULT 0,
                 status TEXT NOT NULL DEFAULT 'active',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                limited_car_key TEXT
             )
         """)
+        cur = await db.execute("PRAGMA table_info(phone_npc_deals)")
+        phone_deal_columns = [row[1] for row in await cur.fetchall()]
+        if "limited_car_key" not in phone_deal_columns:
+            await db.execute("ALTER TABLE phone_npc_deals ADD COLUMN limited_car_key TEXT")
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS phone_calls (
@@ -2569,6 +2584,9 @@ async def init_db():
                     limited_car["stock"], limited_car["description"], limited_car["perk"],
                 ),
             )
+        cur = await db.execute("SELECT car_key, remaining_stock FROM limited_edition_stock WHERE active=1")
+        LIMITED_STOCK_CACHE.clear()
+        LIMITED_STOCK_CACHE.update({str(row[0]): int(row[1] or 0) for row in await cur.fetchall()})
 
         await db.commit()
 
@@ -5010,7 +5028,7 @@ async def edit_text_safe(call, text, **kwargs):
         )
 
 
-def get_market_ad(city, seed, index):
+def get_market_ad(city, seed, index, include_limited=True):
     """Генерирует одинаковые объявления для конкретного города.
 
     Иногда объявление получает скрытую историю автомобиля.
@@ -5023,7 +5041,7 @@ def get_market_ad(city, seed, index):
     city_data = MARKET_CITIES[city]
     multiplier = city_data["multiplier"]
 
-    for _ in range(12):
+    for slot in range(12):
         car = rng.choice(CARS)
         base_price = rng.randint(car["min"], car["max"])
         price = int(base_price * multiplier)
@@ -5052,6 +5070,22 @@ def get_market_ad(city, seed, index):
                 history_multiplier = 1.35
 
         mileage = rng.randint(0, 1_000_000)
+        limited_key = None
+        limited_rng = random.Random(f"limited-npc-market:{city}:{seed}:{slot}")
+        if include_limited:
+            limited_key = maybe_roll_limited_listing_key(limited_rng)
+        if limited_key:
+            limited_car = LIMITED_CARS_BY_KEY[limited_key]
+            car = {
+                "name": limited_car["name"], "year": limited_car["year"], "photo": "",
+                "min": limited_car["price"], "max": limited_car["price"], "repair": 0,
+                "sell_bonus": 1.20, "limited": True,
+            }
+            price = int(limited_car["price"] * multiplier)
+            repair = 0
+            history_type = "limited_edition"
+            history_multiplier = 1.65
+            mileage = limited_rng.randint(0, 5_000)
         ads.append({
             "car": car,
             "price": price,
@@ -5059,6 +5093,8 @@ def get_market_ad(city, seed, index):
             "mileage": mileage,
             "history_type": history_type,
             "history_multiplier": history_multiplier,
+            "limited_car_key": limited_key,
+            "limited_remaining": int(LIMITED_STOCK_CACHE.get(limited_key, 0) or 0) if limited_key else None,
         })
 
     return ads[index % len(ads)]
@@ -5197,20 +5233,24 @@ def market_keyboard(city, seed, index):
     ad = get_market_ad(city, seed, index)
     car = ad["car"]
 
-    kb.button(
-        text=f"🛒 Купить за {ad['price']:,} ₽",
-        callback_data=f"mb:{city}:{seed}:{index}"
-    )
+    if ad.get("limited_car_key") and int(ad.get("limited_remaining", 0) or 0) <= 0:
+        kb.button(text="🔒 Тираж распродан", callback_data="limited_catalog")
+    else:
+        kb.button(
+            text=f"🛒 Купить за {ad['price']:,} ₽",
+            callback_data=f"mb:{city}:{seed}:{index}"
+        )
 
-    kb.button(
-        text="🔍 Осмотреть кузов",
-        callback_data=f"market_inspect:{city}:{seed}:{index}"
-    )
+    if not ad.get("limited_car_key"):
+        kb.button(
+            text="🔍 Осмотреть кузов",
+            callback_data=f"market_inspect:{city}:{seed}:{index}"
+        )
 
-    kb.button(
-        text="🤝 Торговаться",
-        callback_data=f"mn:{city}:{seed}:{index}"
-    )
+        kb.button(
+            text="🤝 Торговаться",
+            callback_data=f"mn:{city}:{seed}:{index}"
+        )
 
     kb.button(
         text="🏙 Сменить город",
@@ -5234,7 +5274,14 @@ def market_caption(city, seed, index):
     city_data = MARKET_CITIES[city]
 
     special_text = ""
-    if ad["history_type"] != "normal":
+    if ad.get("limited_car_key"):
+        special_text = (
+            "💎 <b>ЛИМИТИРОВАННЫЙ ЭКЗЕМПЛЯР!</b>\n"
+            "🎲 Шанс появления: <b>0.0001</b> (1 из 10 000 объявлений).\n"
+            "🏷 В комплекте уникальный номер EX и серийный номер тиража.\n"
+            + (f"🔒 Тираж этой модели распродан: {ad['limited_remaining'] or 0} экземпляров осталось.\n\n" if int(ad.get("limited_remaining", 0) or 0) <= 0 else "\n")
+        )
+    elif ad["history_type"] != "normal":
         special_text = (
             "🔥 <b>УНИКАЛЬНОЕ ОБЪЯВЛЕНИЕ</b>\n"
             "⚠️ История автомобиля скрыта до покупки.\n\n"
@@ -5252,7 +5299,8 @@ def market_caption(city, seed, index):
 
         f"📋 Объявление: <b>{index + 1}/12</b>\n\n"
 
-        "💡 Листай объявления и ищи выгодную машину!"
+        + ("\n💎 Покупка без торга: лимитированная машина выдаётся только один раз.\n" if ad.get("limited_car_key") else "")
+        + "💡 Листай объявления и ищи выгодную машину!"
     )
 
 
@@ -7319,30 +7367,42 @@ async def npc_purchase(user_id: int, deal_id: int, price: int):
     if not deal or deal["status"] != "active":
         return False, "❌ Это предложение уже закрыто."
 
+    limited_award = None
     async with aiosqlite.connect(DB) as db:
+        await db.execute("BEGIN IMMEDIATE")
         cur = await db.execute("SELECT balance FROM players WHERE user_id = ?", (user_id,))
         row = await cur.fetchone()
         balance = int(row[0] or 0) if row else 0
 
         if balance < price:
+            await db.rollback()
             return False, f"❌ Нужно {price:,} ₽, а у тебя только {balance:,} ₽."
 
         await db.execute(
             "UPDATE players SET balance = balance - ?, xp = xp + 0 WHERE user_id = ?",
             (price, user_id)
         )
-        await db.execute(
-            """INSERT INTO garage(
-                user_id, car_name, buy_price, repair_cost, repaired,
-                history_type, history_multiplier, paparazzi_multiplier, paparazzi_until,
-                original_buy_price, owner_count, origin_country, current_country, current_city
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (
-                user_id, deal["car_name"], price, deal["repair_cost"], 0,
-                "normal", 1.0, 1.0, None,
-                price, 1, "Россия", "Россия", "Москва"
+        if deal["limited_car_key"]:
+            limited_award = await issue_limited_vehicle_in_transaction(
+                db, user_id, str(deal["limited_car_key"]), source="phone_npc", paid_price=price
             )
-        )
+            if not limited_award:
+                await db.rollback()
+                await refresh_limited_stock_cache()
+                return False, "❌ Этот эксклюзивный экземпляр уже забрали. Попробуй другие предложения."
+        else:
+            await db.execute(
+                """INSERT INTO garage(
+                    user_id, car_name, buy_price, repair_cost, repaired,
+                    history_type, history_multiplier, paparazzi_multiplier, paparazzi_until,
+                    original_buy_price, owner_count, origin_country, current_country, current_city
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    user_id, deal["car_name"], price, deal["repair_cost"], 0,
+                    "normal", 1.0, 1.0, None,
+                    price, 1, "Россия", "Россия", "Москва"
+                )
+            )
         await db.execute(
             "UPDATE phone_npc_deals SET status='accepted', current_price=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
             (price, deal_id)
@@ -7358,7 +7418,11 @@ async def npc_purchase(user_id: int, deal_id: int, price: int):
             )
         )
         await db.commit()
+    if limited_award:
+        await refresh_limited_stock_cache()
     await seasonal_add_stat(user_id, "collection", 1)
+    if limited_award:
+        return True, "✅ <b>ЭКСКЛЮЗИВНАЯ СДЕЛКА ЗАКРЫТА!</b>\n\n" + limited_award_text(limited_award, "💎 <b>ЛИМИТИРОВАННЫЙ АВТОМОБИЛЬ ПРИОБРЕТЁН!</b>")
     return True, f"✅ <b>ДОГОВОРИЛИСЬ!</b>\n\n🚗 {html.escape(str(deal['car_name']))}\n💰 Цена: <b>{price:,} ₽</b>\n\nАвтомобиль добавлен в гараж."
 
 
@@ -8220,12 +8284,25 @@ async def phone_npc_loop():
                             due = True
                     if not due:
                         continue
-                    offer = random.choice(PHONE_NPC_OFFERS)
+                    offer = dict(random.choice(PHONE_NPC_OFFERS))
+                    limited_key = maybe_roll_limited_spawn_key()
+                    if limited_key:
+                        limited_car = LIMITED_CARS_BY_KEY[limited_key]
+                        offer.update({
+                            "sender": "Коллекционер, срочная продажа",
+                            "subject": "Эксклюзивный лимитированный экземпляр",
+                            "car_name": limited_car["name"],
+                            "ask_price": int(limited_car["price"]),
+                            "min_price": int(limited_car["price"]),
+                            "repair_cost": 0,
+                            "condition": "Лимитированный экземпляр с подтверждённой серией. Цена фиксированная, торг не предусмотрен.",
+                            "message": f"Есть редкий {limited_car['name']}. Экземпляр лимитированного тиража, при покупке выдаётся уникальный EX-номер. Цена {int(limited_car['price']):,} ₽ без торга.",
+                        })
                     cur = await db.execute(
                         """INSERT INTO phone_npc_deals(
                             user_id, sender_name, car_name, asking_price, current_price,
-                            min_price, repair_cost, condition_text
-                        ) VALUES(?,?,?,?,?,?,?,?)""",
+                            min_price, repair_cost, condition_text, limited_car_key
+                        ) VALUES(?,?,?,?,?,?,?,?,?)""",
                         (
                             uid,
                             offer["sender"],
@@ -8235,6 +8312,7 @@ async def phone_npc_loop():
                             offer["min_price"],
                             offer["repair_cost"],
                             offer["condition"],
+                            limited_key,
                         ),
                     )
                     deal_id = cur.lastrowid
@@ -8469,6 +8547,7 @@ async def show_court_list(call):
 def market_main_keyboard():
     kb = InlineKeyboardBuilder()
     kb.button(text="🏙 Города", callback_data="market_cities")
+    kb.button(text="🏢 NPC-салоны", callback_data="npc_showrooms")
     kb.button(text="💎 Лимитированные авто", callback_data="limited_catalog")
     kb.button(text="🏷 Рынок номеров", callback_data="plate_market")
     kb.button(text="🌑 Серый рынок", callback_data="grey_market_new")
@@ -8742,6 +8821,283 @@ async def menu_market_message(message: Message):
 # =========================================================
 # РЫНОК ЗАПЧАСТЕЙ
 # =========================================================
+
+# =========================================================
+# 🏢 NPC-АВТОСАЛОНЫ С РЕДКИМ ЛИМИТИРОВАННЫМ ТИРАЖОМ
+# =========================================================
+
+NPC_SHOWROOMS = {
+    "economy": {
+        "name": "🚗 Economy Motors",
+        "multiplier": 0.90,
+        "source": "economy",
+        "description": "Городской салон с доступными автомобилями и бюджетными вариантами.",
+    },
+    "jdm": {
+        "name": "🇯🇵 JDM Garage",
+        "multiplier": 1.05,
+        "source": "japan",
+        "description": "Японские автомобили, классические JDM-модели и редкие спортивные версии.",
+    },
+    "premium": {
+        "name": "💎 Premium Auto",
+        "multiplier": 1.15,
+        "source": "premium",
+        "description": "Европейские и американские автомобили более высокого класса.",
+    },
+    "hyper": {
+        "name": "🏁 Hypercar Center",
+        "multiplier": 1.25,
+        "source": "hyper",
+        "description": "Редкие спортивные автомобили и мощные модели.",
+    },
+}
+NPC_SHOWROOM_SLOTS = 8
+
+
+def npc_showroom_pool(salon_key):
+    """Возвращает обычный ассортимент салона. Лимитированные модели идут отдельным броском."""
+    salon = NPC_SHOWROOMS[salon_key]
+    all_imports = [dict(car) for cars in IMPORT_CARS.values() for car in cars]
+    all_cars = [dict(car) for car in CARS] + all_imports
+
+    if salon["source"] == "japan":
+        pool = [dict(car) for car in IMPORT_CARS.get("japan", [])]
+    elif salon["source"] == "premium":
+        pool = [
+            dict(car) for cars in IMPORT_CARS.values() for car in cars
+            if (int(car.get("min", 0)) + int(car.get("max", 0))) // 2 >= 350_000
+        ]
+    elif salon["source"] == "hyper":
+        pool = [
+            dict(car) for car in all_cars
+            if max(int(car.get("min", 0)), int(car.get("max", 0))) >= 900_000
+        ]
+    else:
+        pool = [
+            dict(car) for car in all_cars
+            if (int(car.get("min", 0)) + int(car.get("max", 0))) // 2 <= 500_000
+        ]
+
+    return pool or [dict(car) for car in CARS]
+
+
+def get_npc_showroom_offer(salon_key, seed, index):
+    if salon_key not in NPC_SHOWROOMS:
+        raise KeyError(salon_key)
+    salon = NPC_SHOWROOMS[salon_key]
+    rng = random.Random(f"npc-showroom:{salon_key}:{seed}")
+    pool = npc_showroom_pool(salon_key)
+    offers = []
+    for slot in range(NPC_SHOWROOM_SLOTS):
+        car = dict(rng.choice(pool))
+        low = max(1, int(car.get("min", 1)))
+        high = max(low, int(car.get("max", low)))
+        price = int(rng.randint(low, high) * float(salon["multiplier"]))
+        repair = int(car.get("repair", 0))
+        limited_rng = random.Random(f"npc-showroom-limited:{salon_key}:{seed}:{slot}")
+        limited_key = maybe_roll_limited_listing_key(limited_rng)
+        mileage = rng.randint(0, 450_000)
+        history_type = "normal"
+        history_multiplier = 1.0
+
+        if limited_key:
+            limited = LIMITED_CARS_BY_KEY[limited_key]
+            car = {
+                "name": limited["name"], "year": limited["year"], "photo": "",
+                "min": int(limited["price"]), "max": int(limited["price"]),
+                "repair": 0, "sell_bonus": 1.20, "limited": True,
+            }
+            price = int(limited["price"] * float(salon["multiplier"]))
+            repair = 0
+            mileage = limited_rng.randint(0, 5_000)
+            history_type = "limited_edition"
+            history_multiplier = 1.65
+
+        offers.append({
+            "car": car, "price": price, "repair": repair, "mileage": mileage,
+            "limited_car_key": limited_key, "history_type": history_type,
+            "history_multiplier": history_multiplier,
+        })
+    return offers[index % NPC_SHOWROOM_SLOTS]
+
+
+def npc_showrooms_menu_keyboard():
+    kb = InlineKeyboardBuilder()
+    for key, salon in NPC_SHOWROOMS.items():
+        kb.button(text=salon["name"], callback_data=f"npc_showroom_open:{key}")
+    kb.button(text="🔙 Рынок", callback_data="market")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def npc_showroom_offer_keyboard(salon_key, seed, index):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="⬅️", callback_data=f"npc_showroom:{salon_key}:{seed}:{index - 1}")
+    kb.button(text=f"{index % NPC_SHOWROOM_SLOTS + 1}/{NPC_SHOWROOM_SLOTS}", callback_data=f"npc_showroom:{salon_key}:{seed}:{index}")
+    kb.button(text="➡️", callback_data=f"npc_showroom:{salon_key}:{seed}:{index + 1}")
+    offer = get_npc_showroom_offer(salon_key, seed, index)
+    limited_key = offer.get("limited_car_key")
+    if limited_key and int(LIMITED_STOCK_CACHE.get(limited_key, 0) or 0) <= 0:
+        kb.button(text="🔒 Тираж распродан", callback_data="limited_catalog")
+    else:
+        kb.button(text=f"🛒 Купить за {offer['price']:,} ₽", callback_data=f"npc_showroom_buy:{salon_key}:{seed}:{index}")
+    kb.button(text="🏢 Другой салон", callback_data="npc_showrooms")
+    kb.button(text="🔙 Рынок", callback_data="market")
+    kb.adjust(3, 1, 1, 1)
+    return kb.as_markup()
+
+
+async def show_npc_showroom(target, salon_key, seed, index):
+    if salon_key not in NPC_SHOWROOMS:
+        await safe_callback_answer(target, "❌ NPC-салон не найден.", show_alert=True)
+        return
+    index %= NPC_SHOWROOM_SLOTS
+    salon = NPC_SHOWROOMS[salon_key]
+    offer = get_npc_showroom_offer(salon_key, seed, index)
+    car = offer["car"]
+    text = (
+        f"{salon['name']}\n\n"
+        f"{html.escape(salon['description'])}\n\n"
+        f"🚘 <b>{html.escape(str(car['name']))}</b>\n"
+        f"📅 Год: <b>{int(car.get('year', 0))}</b>\n"
+        f"💰 Цена NPC: <b>{int(offer['price']):,} ₽</b>\n"
+        f"🔧 Возможный ремонт: <b>{int(offer['repair']):,} ₽</b>\n"
+    )
+    if offer.get("limited_car_key"):
+        key = offer["limited_car_key"]
+        limited = LIMITED_CARS_BY_KEY[key]
+        remaining = int(LIMITED_STOCK_CACHE.get(key, 0) or 0)
+        text += (
+            "\n💎 <b>ЛИМИТИРОВАННЫЙ ЭКЗЕМПЛЯР!</b>\n"
+            "🎲 Шанс появления: <b>0.0001 = 1 из 10 000 (0.01%)</b> для каждой позиции.\n"
+            f"📦 Тираж модели: <b>{remaining}/{limited['stock']}</b> осталось до покупки.\n"
+            "🏷 При покупке машина получит уникальный серийный номер и EX-номер.\n"
+        )
+    else:
+        text += "\n✨ Автомобиль уже готов к покупке. Каждый новый визит обновляет ассортимент.\n"
+    text += "\n💡 Лимитированные модели нельзя купить напрямую через каталог — их нужно найти в объявлениях."
+    await edit_text_safe(
+        target, text, parse_mode="HTML",
+        reply_markup=npc_showroom_offer_keyboard(salon_key, seed, index),
+    )
+
+
+@dp.callback_query(F.data == "npc_showrooms")
+async def npc_showrooms(call):
+    text = (
+        "🏢 <b>АВТОСАЛОНЫ NPC</b>\n\n"
+        "Выбирай салон и листай его объявления. На каждой позиции есть независимый шанс <b>0.0001</b> "
+        "на появление ограниченной серии (1 из 10 000, или 0.01%).\n\n"
+        "💎 Лимитированные машины выдаются только пока остаётся тираж и всегда получают уникальный EX-номер."
+    )
+    await edit_text_safe(call, text, parse_mode="HTML", reply_markup=npc_showrooms_menu_keyboard())
+    await safe_callback_answer(call)
+
+
+@dp.callback_query(F.data.startswith("npc_showroom_open:"))
+async def npc_showroom_open(call):
+    salon_key = call.data.split(":", 1)[1]
+    if salon_key not in NPC_SHOWROOMS:
+        await safe_callback_answer(call, "❌ NPC-салон не найден.", show_alert=True)
+        return
+    seed = random.randint(100_000, 999_999_999)
+    await show_npc_showroom(call, salon_key, seed, 0)
+    await safe_callback_answer(call)
+
+
+@dp.callback_query(F.data.startswith("npc_showroom:"))
+async def npc_showroom_navigate(call):
+    try:
+        _, salon_key, seed, index = call.data.split(":")
+        seed, index = int(seed), int(index)
+    except (ValueError, IndexError):
+        await safe_callback_answer(call, "❌ Объявление устарело.", show_alert=True)
+        return
+    if salon_key not in NPC_SHOWROOMS:
+        await safe_callback_answer(call, "❌ NPC-салон не найден.", show_alert=True)
+        return
+    await show_npc_showroom(call, salon_key, seed, index)
+    await safe_callback_answer(call)
+
+
+@dp.callback_query(F.data.startswith("npc_showroom_buy:"))
+async def npc_showroom_buy(call):
+    try:
+        _, salon_key, seed, index = call.data.split(":")
+        seed, index = int(seed), int(index)
+        offer = get_npc_showroom_offer(salon_key, seed, index)
+    except (ValueError, KeyError):
+        await safe_callback_answer(call, "❌ Предложение устарело.", show_alert=True)
+        return
+
+    user_id = int(call.from_user.id)
+    price = int(offer["price"])
+    await create_player(user_id, call.from_user.username)
+    limited_award = None
+
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        cur = await db.execute("SELECT balance FROM players WHERE user_id=?", (user_id,))
+        row = await cur.fetchone()
+        balance = int(row[0] or 0) if row else 0
+        if balance < price:
+            await db.rollback()
+            await safe_callback_answer(call, f"❌ Не хватает {price - balance:,} ₽.", show_alert=True)
+            return
+        cur = await db.execute(
+            "UPDATE players SET balance=balance-? WHERE user_id=? AND balance>=?",
+            (price, user_id, price),
+        )
+        if cur.rowcount != 1:
+            await db.rollback()
+            await safe_callback_answer(call, "❌ Баланс изменился. Попробуй ещё раз.", show_alert=True)
+            return
+
+        if offer.get("limited_car_key"):
+            limited_award = await issue_limited_vehicle_in_transaction(
+                db, user_id, offer["limited_car_key"], source="npc_showroom", paid_price=price
+            )
+            if not limited_award:
+                await db.rollback()
+                await refresh_limited_stock_cache()
+                await safe_callback_answer(
+                    call, "❌ Экземпляр уже забрали. Тираж конечный; обнови ассортимент.", show_alert=True
+                )
+                return
+        else:
+            car = offer["car"]
+            await db.execute(
+                "INSERT INTO garage(user_id,car_name,buy_price,repair_cost,repaired,history_type,history_multiplier,original_buy_price,owner_count,origin_country,current_country,current_city,mileage) "
+                "VALUES(?,?,?,?,0,'normal',1.0,?,1,'Россия','Россия',?,?)",
+                (
+                    user_id, str(car["name"]), price, int(offer["repair"]), price,
+                    NPC_SHOWROOMS[salon_key]["name"], int(offer["mileage"]),
+                ),
+            )
+        await db.commit()
+
+    if limited_award:
+        await refresh_limited_stock_cache()
+        await seasonal_add_stat(user_id, "collection", 1)
+        text = limited_award_text(limited_award, "💎 <b>ТЫ НАШЁЛ ЛИМИТИРОВАННЫЙ АВТО В NPC-САЛОНЕ!</b>")
+    else:
+        await seasonal_add_stat(user_id, "collection", 1)
+        text = (
+            "✅ <b>ПОКУПКА В NPC-САЛОНЕ УСПЕШНА</b>\n\n"
+            f"🏢 {html.escape(NPC_SHOWROOMS[salon_key]['name'])}\n"
+            f"🚘 <b>{html.escape(str(offer['car']['name']))}</b>\n"
+            f"💰 Заплачено: <b>{price:,} ₽</b>\n"
+            "🏠 Автомобиль добавлен в твой гараж."
+        )
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🏠 Гараж", callback_data="garage")
+    kb.button(text="🏢 Другой NPC-салон", callback_data="npc_showrooms")
+    kb.button(text="🔙 Рынок", callback_data="market")
+    kb.adjust(1)
+    await edit_text_safe(call, text, parse_mode="HTML", reply_markup=kb.as_markup())
+    await safe_callback_answer(call, "✅ Сделка завершена!")
+
 
 @dp.callback_query(F.data == "parts_market")
 async def parts_market_callback(call):
@@ -9199,6 +9555,9 @@ async def finding_inspect(call):
         weights=list(FINDING_REWARD_WEIGHTS.values()),
         k=1,
     )[0] if found else None
+    limited_key = maybe_roll_limited_spawn_key(random.Random(f"limited-finding:{seed}")) if found else None
+    if limited_key:
+        reward_kind = "limited_car"
 
     # Генерируем результат заранее от seed: повторные нажатия не меняют дроп.
     cash_amount = rng.randint(25_000, 250_000) if reward_kind == "cash" else 0
@@ -9219,6 +9578,7 @@ async def finding_inspect(call):
     repair = int(car["repair"])
     base_price = rng.randint(int(car["min"]), int(car["max"])) if reward_kind == "car" else 0
     mileage = rng.randint(0, 1_000_000)
+    limited_award = None
     if reward_kind == "car":
         history_roll = rng.randint(1, 100)
         if history_roll <= 8:
@@ -9273,7 +9633,44 @@ async def finding_inspect(call):
             return
 
         balance_after_inspection = balance - location["inspect_cost"]
-        if reward_kind == "car":
+        if reward_kind == "limited_car":
+            limited_info = LIMITED_CARS_BY_KEY.get(limited_key, {})
+            if balance_after_inspection < location["recovery_cost"]:
+                await db.execute(
+                    "UPDATE player_finding_cooldowns SET inspected=1, last_started_at=? WHERE user_id=? AND active_seed=?",
+                    (datetime.now().replace(microsecond=0).isoformat(timespec="seconds"), user_id, seed),
+                )
+                await db.commit()
+                text = (
+                    "💎 <b>ОБНАРУЖЕН ЛИМИТИРОВАННЫЙ АВТОМОБИЛЬ!</b>\n\n"
+                    f"🚘 {html.escape(str(limited_info.get('name', 'Эксклюзивный автомобиль')))}\n"
+                    f"📍 {html.escape(location['name'])}\n"
+                    f"🚚 Эвакуация стоит <b>{location['recovery_cost']:,} ₽</b>, но средств не хватает.\n\n"
+                    "Автомобиль не забран; новую находку можно открыть через час."
+                )
+                await show_finding(call, seed, inspected=True, result_text=text)
+                await safe_callback_answer(call, "💸 Не хватает на эвакуацию", show_alert=True)
+                return
+            await db.execute("UPDATE players SET balance=balance-? WHERE user_id=?", (location["recovery_cost"], user_id))
+            limited_award = await issue_limited_vehicle_in_transaction(
+                db, user_id, limited_key, source="finding",
+                paid_price=location["inspect_cost"] + location["recovery_cost"],
+            )
+            if limited_award:
+                reward_text = (
+                    f"📍 Место: <b>{html.escape(location['name'])}</b>\n"
+                    f"🔎 Осмотр: <b>{location['inspect_cost']:,} ₽</b> · 🚚 Эвакуация: <b>{location['recovery_cost']:,} ₽</b>\n\n"
+                    + limited_award_text(limited_award)
+                )
+            else:
+                await db.execute("UPDATE players SET balance=balance+? WHERE user_id=?", (location["recovery_cost"], user_id))
+                cash_amount = 50_000
+                await db.execute("UPDATE players SET balance=balance+? WHERE user_id=?", (cash_amount, user_id))
+                reward_text = (
+                    "🪙 <b>КОМПЕНСАЦИЯ</b>\n\n"
+                    "Лимитированный тираж успели забрать раньше. Стоимость эвакуации возвращена, а за редкую попытку начислено 50 000 ₽."
+                )
+        elif reward_kind == "car":
             if balance_after_inspection < location["recovery_cost"]:
                 await db.execute(
                     "UPDATE player_finding_cooldowns SET inspected = 1, last_started_at = ? WHERE user_id = ? AND active_seed = ?",
@@ -9398,6 +9795,8 @@ async def finding_inspect(call):
         )
         await db.commit()
 
+    if limited_award:
+        await refresh_limited_stock_cache()
     if reward_kind == "car" and history_type in {"rare", "collector"}:
         await player_daily_progress(user_id, "rare_find")
     await show_finding(call, seed, inspected=True, result_text=reward_text)
@@ -12399,7 +12798,9 @@ async def show_plates_inventory(call, page=0):
                 f"🎯 {html.escape(str(pdata.get('effect', 'Влияет на расчётную цену автомобиля.')))}\n"
                 f"{state}\n\n"
             )
-            if car_id is None:
+            if ptype == "exclusive":
+                kb.button(text=f"💎 EX закреплён · {number}", callback_data=f"limited_catalog")
+            elif car_id is None:
                 sell_price = max(1, int(buy_price * pdata['multiplier'] * 0.75))
                 kb.button(text=f"💰 Продать {number} — {sell_price:,} ₽", callback_data=f"plate_sell:{pid}")
             else:
@@ -12494,6 +12895,11 @@ async def plate_install(call):
 async def plate_uninstall(call):
     plate_id = int(call.data.split(":")[1])
     async with aiosqlite.connect(DB) as db:
+        cur = await db.execute("SELECT plate_type FROM plates WHERE id=? AND user_id=?", (plate_id, call.from_user.id))
+        plate_row = await cur.fetchone()
+        if plate_row and plate_row[0] == "exclusive":
+            await safe_callback_answer(call, "💎 EX-номер нельзя снять: он является частью лимитированного экземпляра.", show_alert=True)
+            return
         await db.execute("UPDATE garage SET plate_id = NULL WHERE plate_id = ? AND user_id = ?", (plate_id, call.from_user.id))
         await db.commit()
     await safe_callback_answer("🔓 Номер снят. Теперь его можно продать отдельно.")
@@ -12512,6 +12918,9 @@ async def plate_sell(call):
         if await cursor.fetchone():
             await safe_callback_answer("❌ Сначала сними номер с машины.", show_alert=True); return
         number, ptype, buy_price = row
+        if ptype == "exclusive":
+            await safe_callback_answer(call, "💎 EX-номер навсегда привязан к лимитированному автомобилю и не продаётся отдельно.", show_alert=True)
+            return
         pdata = PLATE_TYPES.get(ptype, PLATE_TYPES["region"])
         sell_price = max(1, int(buy_price * pdata["multiplier"] * 0.75))
         await db.execute("UPDATE players SET balance = balance + ? WHERE user_id = ?", (sell_price, call.from_user.id))
@@ -12901,6 +13310,156 @@ async def social_find_enter(message:Message,state:FSMContext):
 # 💎 МАГАЗИН АВТОМОБИЛЕЙ ОГРАНИЧЕННОГО ТИРАЖА
 # =========================================================
 
+# =========================================================
+# 💎 ОБЩАЯ СИСТЕМА ВЫПАДЕНИЯ ЛИМИТИРОВАННЫХ АВТО
+# =========================================================
+
+def maybe_roll_limited_spawn_key(rng=None):
+    """Шанс 0.0001 на одну проверку; возвращает только модель с оставшимся тиражом."""
+    rng = rng or random
+    if rng.random() >= LIMITED_SPAWN_CHANCE:
+        return None
+    available = [
+        key for key in LIMITED_CARS_BY_KEY
+        if int(LIMITED_STOCK_CACHE.get(key, 0) or 0) > 0
+    ]
+    return rng.choice(available) if available else None
+
+
+def maybe_roll_limited_listing_key(rng=None):
+    """Стабильный бросок для объявлений: сохраняет ключ модели, если её тираж выкупили после показа."""
+    rng = rng or random
+    if rng.random() >= LIMITED_SPAWN_CHANCE:
+        return None
+    keys = list(LIMITED_CARS_BY_KEY)
+    return rng.choice(keys) if keys else None
+
+
+async def refresh_limited_stock_cache():
+    """Синхронизирует быстрый кэш с постоянным остатком в SQLite."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute("SELECT car_key, remaining_stock FROM limited_edition_stock WHERE active=1")
+        rows = await cur.fetchall()
+    LIMITED_STOCK_CACHE.clear()
+    LIMITED_STOCK_CACHE.update({str(row[0]): int(row[1] or 0) for row in rows})
+
+
+async def issue_limited_vehicle_in_transaction(db, user_id, car_key, source, paid_price=0):
+    """Выдаёт один уникальный экземпляр и EX-номер внутри открытой SQLite-транзакции.
+
+    Вызывающая функция должна выполнить BEGIN IMMEDIATE и сама выполнить COMMIT/ROLLBACK.
+    Возвращает словарь с данными награды либо None, если тираж уже недоступен.
+    """
+    if car_key not in LIMITED_CARS_BY_KEY:
+        return None
+
+    cur = await db.execute(
+        "SELECT car_name, year, power, price, total_stock, remaining_stock "
+        "FROM limited_edition_stock WHERE car_key=? AND active=1",
+        (car_key,),
+    )
+    stock = await cur.fetchone()
+    if not stock or int(stock[5] or 0) <= 0:
+        return None
+
+    car_name, year, power, listed_price, total_stock, remaining_stock = stock
+    cur = await db.execute(
+        "SELECT COALESCE(MAX(serial_no), 0)+1 FROM limited_edition_sales WHERE car_key=?",
+        (car_key,),
+    )
+    serial_no = int((await cur.fetchone())[0] or 1)
+    total_stock = int(total_stock or 0)
+    if serial_no > total_stock:
+        return None
+
+    cur = await db.execute(
+        "UPDATE limited_edition_stock SET remaining_stock=remaining_stock-1 "
+        "WHERE car_key=? AND active=1 AND remaining_stock>0",
+        (car_key,),
+    )
+    if cur.rowcount != 1:
+        return None
+
+    plate_number = await claim_unique_plate_number(db, "exclusive", int(user_id))
+    if not plate_number:
+        await db.execute(
+            "UPDATE limited_edition_stock SET remaining_stock=remaining_stock+1 WHERE car_key=?",
+            (car_key,),
+        )
+        return None
+
+    plate_data = PLATE_TYPES["exclusive"]
+    plate_cur = await db.execute(
+        "INSERT INTO plates(user_id, number, plate_type, buy_price, purchase_cost) VALUES(?,?,?,?,0)",
+        (int(user_id), plate_number, "exclusive", int(plate_data["price"])),
+    )
+    plate_id = int(plate_cur.lastrowid)
+    serial_text = f"{serial_no:03d}/{total_stock:03d}"
+    listed_price = int(listed_price or 0)
+    source_labels = {
+        "npc_market": "NPC-рынок",
+        "npc_showroom": "NPC-автосалон",
+        "phone_npc": "NPC-продавец по телефону",
+        "finding": "Автомобильная находка",
+        "battle_pass_case": "Кейс Battle Pass",
+        "clan_case": "Клановый кейс",
+        "abandoned_dealership": "Заброшенный автосалон",
+    }
+    source_label = source_labels.get(str(source), str(source))
+
+    garage_cur = await db.execute(
+        """INSERT INTO garage(
+            user_id, car_name, buy_price, repair_cost, repaired, history_type,
+            history_multiplier, paparazzi_multiplier, paparazzi_until,
+            purchased_at, original_buy_price, original_purchased_at, owner_count,
+            origin_country, current_country, current_city, limited_car_key,
+            limited_number, plate_id, mileage
+        ) VALUES(?,?,?,0,1,'limited_edition',1.65,1.0,NULL,CURRENT_TIMESTAMP,?,CURRENT_TIMESTAMP,1,
+                 'Лимитированная серия','Россия',?,?,?, ?,0)""",
+        (
+            int(user_id), str(car_name), listed_price, listed_price,
+            source_label, str(car_key), serial_text, plate_id,
+        ),
+    )
+    garage_car_id = int(garage_cur.lastrowid)
+    await db.execute(
+        """INSERT INTO limited_edition_sales
+           (car_key, user_id, garage_car_id, serial_no, sale_price)
+           VALUES(?,?,?,?,?)""",
+        (str(car_key), int(user_id), garage_car_id, serial_no, max(0, int(paid_price or 0))),
+    )
+
+    remaining_after = max(0, int(remaining_stock or 0) - 1)
+    return {
+        "key": str(car_key),
+        "name": str(car_name),
+        "year": int(year),
+        "power": int(power),
+        "price": listed_price,
+        "serial": serial_text,
+        "plate_number": str(plate_number),
+        "plate_type": "exclusive",
+        "remaining": remaining_after,
+        "total": total_stock,
+        "garage_car_id": garage_car_id,
+        "source": source_label,
+    }
+
+
+def limited_award_text(award, headline="💎 <b>ЛИМИТИРОВАННЫЙ АВТОМОБИЛЬ НАЙДЕН!</b>"):
+    if not award:
+        return ""
+    return (
+        f"{headline}\n\n"
+        f"🚘 <b>{html.escape(award['name'])}</b> · {award['year']} г. · {award['power']} л.с.\n"
+        f"💰 Игровая оценка: <b>{award['price']:,} ₽</b>\n"
+        f"🏷 Эксклюзивный номер: <b>{html.escape(award['plate_number'])}</b>\n"
+        f"🔢 Серийный номер экземпляра: <b>{html.escape(award['serial'])}</b>\n"
+        f"📦 Остаток тиража: <b>{award['remaining']}/{award['total']}</b>\n\n"
+        "✨ EX-номер автоматически установлен на автомобиль и не повторяется. Машина уже в гараже!"
+    )
+
+
 def limited_catalog_keyboard(rows):
     kb = InlineKeyboardBuilder()
     for row in rows:
@@ -12912,6 +13471,7 @@ def limited_catalog_keyboard(rows):
             callback_data=f"limited_view:{row['car_key']}",
         )
     kb.button(text="🔄 Обновить", callback_data="limited_catalog")
+    kb.button(text="🏢 Искать в NPC-салонах", callback_data="npc_showrooms")
     kb.button(text="🔙 Рынок", callback_data="market")
     kb.adjust(1)
     return kb.as_markup()
@@ -12941,7 +13501,10 @@ async def limited_catalog(call):
     else:
         lines = [
             "💎 <b>ЛИМИТИРОВАННЫЕ АВТО</b>",
-            "У каждой модели фиксированный тираж. Распроданные экземпляры автоматически не появляются снова.\n",
+            "Это не магазин с гарантированной покупкой: лимитированные экземпляры появляются случайно.\n"
+            "Шанс — 0.0001 (1 из 10 000, то есть 0.01%) на каждую позицию NPC-салона/объявления, находку или открытие кейса.\n"
+            "Также редкие лоты могут появляться в телефонных предложениях NPC и заброшенном автосалоне.\n"
+            "Каждая найденная машина получает уникальный EX-номер и серийный номер.\n",
         ]
         for row in rows:
             left = int(row["remaining_stock"] or 0)
@@ -12975,9 +13538,10 @@ async def limited_view(call):
     total = int(row["total_stock"] or 0)
     kb = InlineKeyboardBuilder()
     if remaining > 0:
-        kb.button(text=f"🛒 Купить за {int(row['price']):,} ₽", callback_data=f"limited_buy:{car_key}")
+        kb.button(text="🏢 Искать в NPC-салонах", callback_data="npc_showrooms")
+        kb.button(text="🔎 Искать на городском рынке", callback_data="market_cities")
     else:
-        kb.button(text="🔒 Тираж распродан", callback_data="limited_catalog")
+        kb.button(text="🔒 Все экземпляры найдены", callback_data="limited_catalog")
     kb.button(text="🔄 Обновить", callback_data=f"limited_view:{car_key}")
     kb.button(text="🔙 К лимитированным авто", callback_data="limited_catalog")
     kb.adjust(1)
@@ -12989,10 +13553,10 @@ async def limited_view(call):
         f"⚡ Мощность: <b>{int(row['power'])} л.с.</b>\n"
         f"💰 Стоимость: <b>{int(row['price']):,} ₽</b>\n"
         f"📦 Доступно: <b>{remaining} из {total}</b>\n"
-        f"🏷 Серийный номер после покупки: будет присвоен автоматически\n\n"
+        "🏷 При выпадении выдаются уникальный серийный номер и EX-номер.\n\n"
         f"{html.escape(row['description'])}\n\n"
         f"✨ <b>Особенность:</b> {html.escape(row['perk'])}\n\n"
-        "⚠️ Покупка окончательная: экземпляр вычитается из общего серверного тиража."
+        "📍 Ищи экземпляр в NPC-салонах, городских объявлениях, автомобильных находках, заброшенном салоне, телефонных предложениях и кейсах."
     )
     await edit_text_safe(call, text, parse_mode="HTML", reply_markup=kb.as_markup())
     await safe_callback_answer(call)
@@ -13000,113 +13564,13 @@ async def limited_view(call):
 
 @dp.callback_query(F.data.startswith("limited_buy:"))
 async def limited_buy(call):
-    car_key = call.data.split(":", 1)[1].strip()
-    if car_key not in LIMITED_CARS_BY_KEY:
-        await safe_callback_answer(call, "❌ Некорректная модель.", show_alert=True)
-        return
-
-    await create_player(call.from_user.id, call.from_user.username)
-    failure = None
-    purchase = None
-
-    # BEGIN IMMEDIATE сериализует покупки: два игрока не смогут купить один последний экземпляр.
-    async with aiosqlite.connect(DB) as db:
-        await db.execute("BEGIN IMMEDIATE")
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute(
-            "SELECT * FROM limited_edition_stock WHERE car_key=? AND active=1",
-            (car_key,),
-        )
-        stock = await cur.fetchone()
-        if not stock:
-            failure = "Эта модель не найдена."
-        elif int(stock["remaining_stock"] or 0) <= 0:
-            failure = "Тираж уже полностью распродан."
-        else:
-            price = int(stock["price"])
-            cur = await db.execute("SELECT balance FROM players WHERE user_id=?", (call.from_user.id,))
-            player = await cur.fetchone()
-            balance = int(player["balance"] or 0) if player else 0
-            if balance < price:
-                failure = f"Не хватает {price - balance:,} ₽ для покупки."
-            else:
-                cur = await db.execute(
-                    "UPDATE players SET balance=balance-? WHERE user_id=? AND balance>=?",
-                    (price, call.from_user.id, price),
-                )
-                if cur.rowcount != 1:
-                    failure = "Не удалось списать деньги. Обнови баланс и попробуй ещё раз."
-                else:
-                    cur = await db.execute(
-                        "UPDATE limited_edition_stock SET remaining_stock=remaining_stock-1 "
-                        "WHERE car_key=? AND remaining_stock>0",
-                        (car_key,),
-                    )
-                    if cur.rowcount != 1:
-                        failure = "Кто-то только что купил последний экземпляр. Деньги не списаны."
-                    else:
-                        cur = await db.execute(
-                            "SELECT COALESCE(MAX(serial_no), 0)+1 FROM limited_edition_sales WHERE car_key=?",
-                            (car_key,),
-                        )
-                        serial_no = int((await cur.fetchone())[0])
-                        total_stock = int(stock["total_stock"] or 0)
-                        serial_text = f"{serial_no:03d}/{total_stock:03d}"
-                        cur = await db.execute(
-                            """INSERT INTO garage
-                               (user_id, car_name, buy_price, repair_cost, repaired, history_type,
-                                history_multiplier, purchased_at, original_buy_price, original_purchased_at,
-                                owner_count, origin_country, current_country, current_city,
-                                limited_car_key, limited_number)
-                               VALUES (?, ?, ?, 0, 1, 'limited_edition', 1.65, CURRENT_TIMESTAMP,
-                                       ?, CURRENT_TIMESTAMP, 1, 'Лимитированная серия', 'Россия', 'Москва', ?, ?)""",
-                            (call.from_user.id, stock["car_name"], price, price, car_key, serial_text),
-                        )
-                        garage_car_id = int(cur.lastrowid)
-                        await db.execute(
-                            """INSERT INTO limited_edition_sales
-                               (car_key, user_id, garage_car_id, serial_no, sale_price)
-                               VALUES (?, ?, ?, ?, ?)""",
-                            (car_key, call.from_user.id, garage_car_id, serial_no, price),
-                        )
-                        cur = await db.execute(
-                            "SELECT remaining_stock FROM limited_edition_stock WHERE car_key=?",
-                            (car_key,),
-                        )
-                        remaining_after = int((await cur.fetchone())[0])
-                        await db.commit()
-                        purchase = {
-                            "name": str(stock["car_name"]),
-                            "price": price,
-                            "year": int(stock["year"]),
-                            "power": int(stock["power"]),
-                            "serial": serial_text,
-                            "remaining": remaining_after,
-                            "total": total_stock,
-                        }
-        if failure:
-            await db.rollback()
-
-    if failure:
-        await safe_callback_answer(call, f"❌ {failure}", show_alert=True)
-        return
-
-    kb = InlineKeyboardBuilder()
-    kb.button(text="💎 Каталог лимитированных авто", callback_data="limited_catalog")
-    kb.button(text="🏠 Мой гараж", callback_data="garage")
-    kb.button(text="🚗 Рынок", callback_data="market")
-    kb.adjust(1)
-    text = (
-        "✅ <b>ЛИМИТИРОВАННЫЙ АВТОМОБИЛЬ КУПЛЕН!</b>\n\n"
-        f"🚘 <b>{html.escape(purchase['name'])}</b>\n"
-        f"📅 Год: <b>{purchase['year']}</b> · ⚡ {purchase['power']} л.с.\n"
-        f"💰 Оплачено: <b>{purchase['price']:,} ₽</b>\n"
-        f"🏷 Твой серийный номер: <b>{purchase['serial']}</b>\n"
-        f"📦 Остаток тиража: <b>{purchase['remaining']}/{purchase['total']}</b>\n\n"
-        "💎 Машина добавлена в гараж. Серийный номер сохранится после перезапуска бота."
+    # Старые кнопки от прежней версии не должны обходить редкий шанс появления.
+    await safe_callback_answer(
+        call,
+        "💎 Теперь лимитированные авто нельзя купить напрямую. Ищи их с шансом 0.0001 в NPC-салонах, объявлениях, находках и кейсах.",
+        show_alert=True,
     )
-    await edit_text_safe(call, text, parse_mode="HTML", reply_markup=kb.as_markup())
-    await safe_callback_answer(call, "Покупка успешна!")
+    await limited_catalog(call)
 
 
 # =========================================================
@@ -13160,6 +13624,10 @@ async def negotiate_car(call):
         await safe_callback_answer(call, "❌ Объявление устарело.", show_alert=True)
         return
 
+    if ad.get("limited_car_key"):
+        await safe_callback_answer(call, "💎 За лимитированные экземпляры торг не предусмотрен.", show_alert=True)
+        return
+
     car_name = ad["car"]["name"]
     price = int(ad["price"])
     repair = int(ad["repair"])
@@ -13201,6 +13669,10 @@ async def trade_result(call):
         ad = get_market_ad(city, seed, index)
     except (ValueError, KeyError):
         await safe_callback_answer(call, "❌ Объявление устарело.", show_alert=True)
+        return
+
+    if ad.get("limited_car_key"):
+        await safe_callback_answer(call, "💎 За лимитированные экземпляры торг не предусмотрен.", show_alert=True)
         return
 
     car_name = ad["car"]["name"]
@@ -13291,6 +13763,60 @@ async def market_inspect(call):
     await safe_callback_answer(call)
 
 
+async def buy_limited_from_market(call, ad, city):
+    user_id = int(call.from_user.id)
+    price = int(ad["price"])
+    car_key = str(ad.get("limited_car_key") or "")
+    if car_key not in LIMITED_CARS_BY_KEY:
+        await safe_callback_answer(call, "❌ Лимитированное объявление устарело.", show_alert=True)
+        return
+
+    await create_player(user_id, call.from_user.username)
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        cur = await db.execute("SELECT balance FROM players WHERE user_id=?", (user_id,))
+        player = await cur.fetchone()
+        balance = int(player[0] or 0) if player else 0
+        if balance < price:
+            await db.rollback()
+            await safe_callback_answer(call, f"❌ Не хватает {price - balance:,} ₽.", show_alert=True)
+            return
+        cur = await db.execute(
+            "UPDATE players SET balance=balance-? WHERE user_id=? AND balance>=?",
+            (price, user_id, price),
+        )
+        if cur.rowcount != 1:
+            await db.rollback()
+            await safe_callback_answer(call, "❌ Баланс изменился. Обнови объявление.", show_alert=True)
+            return
+        award = await issue_limited_vehicle_in_transaction(
+            db, user_id, car_key, source="npc_market", paid_price=price
+        )
+        if not award:
+            await db.rollback()
+            await refresh_limited_stock_cache()
+            await safe_callback_answer(call, "❌ Этот лимитированный экземпляр уже забрали. Тираж не бесконечный.", show_alert=True)
+            return
+        await db.commit()
+
+    await refresh_limited_stock_cache()
+    await seasonal_add_stat(user_id, "collection", 1)
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🏠 Мой гараж", callback_data="garage")
+    kb.button(text="🔎 Ещё объявления", callback_data="market_cities")
+    kb.button(text="💎 Реестр лимитированных авто", callback_data="limited_catalog")
+    kb.adjust(1)
+    await edit_text_safe(
+        call,
+        "✅ <b>ТЕБЕ ПОПАЛСЯ ЛИМИТИРОВАННЫЙ ЛОТ!</b>\n\n"
+        f"🏙 Город: <b>{html.escape(MARKET_CITIES.get(city, {}).get('name', city))}</b>\n"
+        f"💸 Оплачено NPC: <b>{price:,} ₽</b>\n\n"
+        + limited_award_text(award, "💎 <b>ЭКСКЛЮЗИВНЫЙ АВТОМОБИЛЬ КУПЛЕН!</b>"),
+        parse_mode="HTML", reply_markup=kb.as_markup(),
+    )
+    await safe_callback_answer(call, "💎 Тираж обновлён!")
+
+
 @dp.callback_query(F.data.startswith("mb:"))
 async def buy_car(call):
 
@@ -13301,6 +13827,10 @@ async def buy_car(call):
         ad = get_market_ad(city, seed, index)
     except (ValueError, KeyError):
         await safe_callback_answer(call, "❌ Объявление устарело.", show_alert=True)
+        return
+
+    if ad.get("limited_car_key"):
+        await buy_limited_from_market(call, ad, city)
         return
 
     car_name = ad["car"]["name"]
@@ -15048,7 +15578,7 @@ async def show_dealer_transport_market(call, city, seed, index):
     await ensure_transporter(call.from_user.id)
     level, _, _ = await get_transporter(call.from_user.id)
     index %= 12
-    ad = get_market_ad(city, seed, index)
+    ad = get_market_ad(city, seed, index, include_limited=False)
     car = ad["car"]
     transport = transporter_price(level)
     transporter_worker_level = await get_worker_level(call.from_user.id, "transporter")
@@ -15120,7 +15650,7 @@ async def dealer_transport_buy(call):
         return
     await ensure_transporter(user_id)
     level, _, _ = await get_transporter(user_id)
-    ad = get_market_ad(city, seed, index)
+    ad = get_market_ad(city, seed, index, include_limited=False)
     car = ad["car"]
     transport = transporter_price(level)
     transporter_worker_level = await get_worker_level(call.from_user.id, "transporter")
@@ -18051,6 +18581,15 @@ def abandoned_dealership_loot():
         cars.append(car)
         if len(cars) >= 7:
             break
+    abandoned_limited_key = maybe_roll_limited_spawn_key(rng) if cars else None
+    if abandoned_limited_key:
+        limited_car = LIMITED_CARS_BY_KEY[abandoned_limited_key]
+        slot = rng.randrange(len(cars))
+        cars[slot] = {
+            "name": limited_car["name"], "year": limited_car["year"],
+            "min": int(limited_car["price"]), "max": int(limited_car["price"]),
+            "repair": 0, "limited_key": abandoned_limited_key,
+        }
 
     # Два редких номера: triple/gold/lucky.
     plate_types = ["gold", "triple", "lucky"]
@@ -18119,6 +18658,7 @@ async def abandoned_dealership_open(call):
 async def abandoned_dealership_buy(call):
     user_id = call.from_user.id
     cars, plates, parts = abandoned_dealership_loot()
+    limited_awards = []
 
     async with aiosqlite.connect(DB) as db:
         db.row_factory = aiosqlite.Row
@@ -18141,8 +18681,18 @@ async def abandoned_dealership_buy(call):
             (ABANDONED_DEALERSHIP_COST, user_id),
         )
 
-        # 7 машин сразу отправляются в гараж.
+        # 7 машин сразу отправляются в гараж; редкий лимитированный слот выдаётся через общий реестр.
         for car in cars:
+            if car.get("limited_key"):
+                award = await issue_limited_vehicle_in_transaction(
+                    db, user_id, car["limited_key"], source="abandoned_dealership",
+                    paid_price=ABANDONED_DEALERSHIP_COST // 7,
+                )
+                if award:
+                    limited_awards.append(award)
+                    continue
+                # Если экземпляр достался другому игроку до оплаты, этот слот становится обычным авто.
+                car = dict(random.choice(CARS))
             await db.execute(
                 """INSERT INTO garage(
                     user_id, car_name, buy_price, repair_cost, repaired, history_type,
@@ -18201,6 +18751,8 @@ async def abandoned_dealership_buy(call):
         )
         await db.commit()
 
+    if limited_awards:
+        await refresh_limited_stock_cache()
     car_names = [c["name"] for c in cars]
     plate_lines = []
     for p in plates:
@@ -18214,6 +18766,7 @@ async def abandoned_dealership_buy(call):
         )
     plate_text = "\n".join(plate_lines)
     part_text = "\n".join(f"🔧 {p['name']} ×{p['quantity']}" for p in parts)
+    limited_text = "\n\n".join(limited_award_text(a, "💎 <b>ЭКСКЛЮЗИВ ИЗ ЗАБРОШЕННОГО САЛОНА!</b>") for a in limited_awards)
     text = (
         "🎉 <b>АВТОСАЛОН РАЗОБРАН!</b>\n\n"
         "Ты заплатил <b>20 000 000 ₽</b> и получил содержимое старого салона.\n\n"
@@ -18221,6 +18774,7 @@ async def abandoned_dealership_buy(call):
         "\n".join(f"• {name}" for name in car_names) +
         "\n\n🏷 <b>2 редких номера:</b>\n" + plate_text +
         "\n\n" + part_text +
+        ("\n\n" + limited_text if limited_text else "") +
         "\n\n✅ Машины отправлены в гараж, номера — в коллекцию, запчасти — на склад."
     )
     kb = InlineKeyboardBuilder()
@@ -21793,40 +22347,51 @@ async def bp_open_case(user_id):
         bp_row = await bp.fetchone()
         current_xp = int(bp_row[0] or 0) if bp_row else 0
 
-        roll = random.random()
-        if roll < 0.52:
-            received = []
-            for _ in range(2):
-                part_key = random.choice(list(BP_PARTS.keys()))
-                received.append(BP_PARTS[part_key])
-                await db.execute(
-                    """
-                    INSERT INTO player_parts(user_id,part_key,part_name,quantity)
-                    VALUES(?,?,?,1)
-                    ON CONFLICT(user_id,part_key)
-                    DO UPDATE SET quantity=quantity+1, updated_at=CURRENT_TIMESTAMP
-                    """,
-                    (user_id, part_key, BP_PARTS[part_key]),
-                )
-            reward_text = "🔩 Две случайные запчасти:\n" + "\n".join(f"• {name}" for name in received)
-        elif roll < 0.77:
-            await db.execute(
-                "UPDATE battle_pass_users SET currency=currency+15, updated_at=CURRENT_TIMESTAMP WHERE user_id=? AND season=?",
-                (user_id, BP_SEASON),
+        limited_key = maybe_roll_limited_spawn_key()
+        limited_award = None
+        if limited_key:
+            limited_award = await issue_limited_vehicle_in_transaction(
+                db, user_id, limited_key, source="battle_pass_case", paid_price=0
             )
-            reward_text = "🎟 +15 валюты Battle Pass"
-        elif roll < 0.95:
-            await db.execute("UPDATE players SET balance=balance+250000 WHERE user_id=?", (user_id,))
-            reward_text = "💰 +250 000 ₽"
-        elif battle_pass_level(current_xp) < BP_MAX_LEVEL:
-            await db.execute(
-                "UPDATE battle_pass_users SET xp=xp+1000, updated_at=CURRENT_TIMESTAMP WHERE user_id=? AND season=?",
-                (user_id, BP_SEASON),
+        if limited_award:
+            reward_text = limited_award_text(
+                limited_award, "💎 <b>СУПЕР-ДРОП ИЗ КЕЙСА BATTLE PASS!</b>"
             )
-            reward_text = "⚡ +1 000 XP Battle Pass"
         else:
-            await db.execute("UPDATE players SET balance=balance+500000 WHERE user_id=?", (user_id,))
-            reward_text = "💰 +500 000 ₽ (бонус вместо XP за максимальный уровень)"
+            roll = random.random()
+            if roll < 0.52:
+                received = []
+                for _ in range(2):
+                    part_key = random.choice(list(BP_PARTS.keys()))
+                    received.append(BP_PARTS[part_key])
+                    await db.execute(
+                        """
+                        INSERT INTO player_parts(user_id,part_key,part_name,quantity)
+                        VALUES(?,?,?,1)
+                        ON CONFLICT(user_id,part_key)
+                        DO UPDATE SET quantity=quantity+1, updated_at=CURRENT_TIMESTAMP
+                        """,
+                        (user_id, part_key, BP_PARTS[part_key]),
+                    )
+                reward_text = "🔩 Две случайные запчасти:\n" + "\n".join(f"• {name}" for name in received)
+            elif roll < 0.77:
+                await db.execute(
+                    "UPDATE battle_pass_users SET currency=currency+15, updated_at=CURRENT_TIMESTAMP WHERE user_id=? AND season=?",
+                    (user_id, BP_SEASON),
+                )
+                reward_text = "🎟 +15 валюты Battle Pass"
+            elif roll < 0.95:
+                await db.execute("UPDATE players SET balance=balance+250000 WHERE user_id=?", (user_id,))
+                reward_text = "💰 +250 000 ₽"
+            elif battle_pass_level(current_xp) < BP_MAX_LEVEL:
+                await db.execute(
+                    "UPDATE battle_pass_users SET xp=xp+1000, updated_at=CURRENT_TIMESTAMP WHERE user_id=? AND season=?",
+                    (user_id, BP_SEASON),
+                )
+                reward_text = "⚡ +1 000 XP Battle Pass"
+            else:
+                await db.execute("UPDATE players SET balance=balance+500000 WHERE user_id=?", (user_id,))
+                reward_text = "💰 +500 000 ₽ (бонус вместо XP за максимальный уровень)"
 
         await db.execute(
             "DELETE FROM battle_pass_inventory WHERE user_id=? AND item_key=? AND quantity<=0",
@@ -21834,6 +22399,8 @@ async def bp_open_case(user_id):
         )
         await db.commit()
 
+    if limited_award:
+        await refresh_limited_stock_cache()
     return True, "🎁 <b>КЕЙС BATTLE PASS ОТКРЫТ!</b>\n\n" + reward_text
 
 
@@ -22939,8 +23506,11 @@ async def clan_case_callback(call):
     if not clan:
         await safe_callback_answer(call, "Сначала вступи в клан.", show_alert=True)
         return
-    reward = clan_case_roll()
+    limited_key = maybe_roll_limited_spawn_key()
+    reward = {"kind": "limited_car", "key": limited_key} if limited_key else clan_case_roll()
+    limited_award = None
     async with aiosqlite.connect(DB) as db:
+        await db.execute("BEGIN IMMEDIATE")
         cur = await db.execute("UPDATE clans SET treasury=treasury-? WHERE id=? AND treasury>=?", (CLAN_CASE_COST, clan["id"], CLAN_CASE_COST))
         if cur.rowcount != 1:
             await safe_callback_answer(
@@ -22949,8 +23519,16 @@ async def clan_case_callback(call):
                 show_alert=True,
             )
             return
+        if reward["kind"] == "limited_car":
+            limited_award = await issue_limited_vehicle_in_transaction(
+                db, call.from_user.id, reward["key"], source="clan_case", paid_price=CLAN_CASE_COST,
+            )
+            if not limited_award:
+                reward = clan_case_roll()
         if reward["kind"] == "money":
             await db.execute("UPDATE players SET balance=balance+? WHERE user_id=?", (int(reward["value"]), call.from_user.id))
+        elif reward["kind"] == "limited_car":
+            pass  # Уже добавлена в гараж общей функцией issue_limited_vehicle_in_transaction.
         else:
             await clan_insert_car(
                 db, call.from_user.id, reward["name"], reward["value"],
@@ -22960,8 +23538,14 @@ async def clan_case_callback(call):
         await clan_add_task_progress(db, clan["id"], "case", 1)
         await db.commit()
 
+    if limited_award:
+        await refresh_limited_stock_cache()
     if reward["kind"] == "money":
         prize_text = f"💵 Ты получил <b>{int(reward['value']):,} ₽</b> на личный баланс."
+    elif reward["kind"] == "limited_car" and limited_award:
+        prize_text = limited_award_text(
+            limited_award, "💎 <b>СУПЕР-ДРОП ИЗ КЛАНОВОГО КЕЙСА!</b>"
+        )
     elif reward["kind"] == "super_car":
         prize_text = (
             "💎 <b>СУПЕР-ЭКСКЛЮЗИВНЫЙ АВТОМОБИЛЬ!</b>\n"
