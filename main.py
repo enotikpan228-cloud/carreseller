@@ -21,10 +21,8 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 
-# Укажи свежий токен через переменную окружения BOT_TOKEN в настройках хостинга.
-# Не храни токен внутри исходного кода.
 TOKEN = os.getenv("BOT_TOKEN", "").strip()
-DB = "game.db"
+DB = os.getenv("DATABASE_PATH", str(Path(__file__).resolve().parent / "game.db"))
 
 # Администраторы задаются через переменную окружения ADMIN_IDS=123,456
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "5423162716").split(",") if x.strip().isdigit()}
@@ -3337,9 +3335,16 @@ async def nurburgring_open(call):
     )
     if award:
         w = award["winner"]
-        text += (f"🎉 <b>Итоги {award['month']}</b>\n"
-                 f"🥇 {html.escape(str(w['username']))} — {format_nurburgring_time(w['lap_time'])}\n"
-                 f"💰 Выплачено: <b>{award['prize']:,} ₽</b> + 500 XP\n\n")
+        # Отдельные переменные сохраняют совместимость с Python 3.10/3.11.
+        award_month = html.escape(str(award.get("month", "")))
+        winner_username = html.escape(str(w.get("username", "Игрок")))
+        winner_lap_time = format_nurburgring_time(w.get("lap_time", 0))
+        award_prize = int(award.get("prize", 0) or 0)
+        text += (
+            f"🎉 <b>Итоги {award_month}</b>\n"
+            f"🥇 {winner_username} — {winner_lap_time}\n"
+            f"💰 Выплачено: <b>{award_prize:,} ₽</b> + 500 XP\n\n"
+        )
     text += "🏆 <b>ТОП-10 МЕСЯЦА</b>\n\n"
     if not rows:
         text += "Пока никто не установил результат.\n"
@@ -13154,6 +13159,10 @@ async def pts_car(call):
     turbo = bool(row["build_turbo"])
     status = "✅ Отремонтирована" if row["repaired"] else "🔧 Требует ремонта"
     registered = "✅ Да" if row["registered"] else "❌ Нет"
+    tire_condition = int(row["tire_condition"] or 0)
+    fluid_condition = int(row["fluid_condition"] or 0)
+    tires_text = "спущены" if tire_condition <= 20 else f"состояние {tire_condition}%"
+    fluids_text = "требуют полной замены" if fluid_condition <= 20 else f"состояние {fluid_condition}%"
     text = (
         "📜 <b>ПТС АВТОМОБИЛЯ</b>\n\n"
         f"🚘 Марка/модель: <b>{row['car_name']}</b>\n"
@@ -13178,8 +13187,8 @@ async def pts_car(call):
             f"🦠 Плесень: <b>{int(row['mold_level'] or 0)}%</b>\n"
             f"🐀 Следы животных: <b>{int(row['animal_damage'] or 0)}%</b>\n"
             f"🪫 Аккумулятор: <b>{int(row['battery_charge'] or 0)}% заряда</b>\n"
-            f"🛞 Колёса: <b>{'спущены' if int(row['tire_condition'] or 0) <= 20 else f"состояние {int(row['tire_condition'] or 0)}%"}</b>\n"
-            f"🛢 Жидкости: <b>{'требуют полной замены' if int(row['fluid_condition'] or 0) <= 20 else f"состояние {int(row['fluid_condition'] or 0)}%"}</b>\n"
+            f"🛞 Колёса: <b>{tires_text}</b>\n"
+            f"🛢 Жидкости: <b>{fluids_text}</b>\n"
             if int(row['abandoned_years'] or 0) > 0 else ""
         )
         + f"🧾 Сертификат реставрации: <b>{'✅ выдан' if row['certificate_issued'] else '❌ нет'}</b>\n\n"
