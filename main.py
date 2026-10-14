@@ -1026,6 +1026,7 @@ async def init_db():
                 balance INTEGER DEFAULT 500000,
                 xp INTEGER DEFAULT 0,
                 level INTEGER DEFAULT 1,
+                coins INTEGER NOT NULL DEFAULT 0,
                 registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -1050,6 +1051,8 @@ async def init_db():
             await db.execute("ALTER TABLE players ADD COLUMN blocked_until TEXT")
         if "admin_note" not in columns:
             await db.execute("ALTER TABLE players ADD COLUMN admin_note TEXT DEFAULT ''")
+        if "coins" not in columns:
+            await db.execute("ALTER TABLE players ADD COLUMN coins INTEGER NOT NULL DEFAULT 0")
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS admin_logs (
@@ -2514,6 +2517,18 @@ async def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS coin_payments (
+                telegram_payment_charge_id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                package_key TEXT NOT NULL,
+                coins_amount INTEGER NOT NULL,
+                stars_amount INTEGER NOT NULL,
+                payload TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
         await db.execute("""
             CREATE TABLE IF NOT EXISTS battle_pass_task_claims (
                 user_id INTEGER NOT NULL,
@@ -6031,6 +6046,7 @@ def menu():
             ],
             [
                 KeyboardButton(text="🎫 Battle Pass"),
+                KeyboardButton(text="🪙 Коины"),
             ],
             [
                 KeyboardButton(text="🧳 Находка"),
@@ -12935,7 +12951,7 @@ async def build_profile_text(user_id: int) -> str:
     async with aiosqlite.connect(DB) as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute(
-            "SELECT username, balance, xp, level, registered_at FROM players WHERE user_id = ?",
+            "SELECT username, balance, xp, level, registered_at, coins FROM players WHERE user_id = ?",
             (user_id,),
         )
         player = await cur.fetchone()
@@ -12993,6 +13009,7 @@ async def build_profile_text(user_id: int) -> str:
             f"👤 Игрок: <b>{username}</b>\n"
             f"📅 Зарегистрирован: <b>{registered_at}</b>\n\n"
             f"💰 Деньги: <b>{balance:,} ₽</b>\n"
+            f"🪙 Коины: <b>{int(player['coins'] or 0):,}</b>\n"
             f"⭐ Уровень: <b>{level}</b>\n"
             f"✨ Опыт: <b>{xp}/{next_xp}</b> XP\n\n"
             "🏠 <b>ИМУЩЕСТВО</b>\n"
@@ -20022,8 +20039,9 @@ def admin_keyboard():
     kb.button(text="🛠 Технические работы", callback_data="admin_maintenance")
     kb.button(text="📜 История объявлений", callback_data="admin_announcements")
     kb.button(text="📝 Логи админов", callback_data="admin_logs")
+    kb.button(text="⚠️ Сброс всем игрокам", callback_data="admin_reset_all")
     kb.button(text="❌ Закрыть", callback_data="admin_close")
-    kb.adjust(2, 2, 2, 1)
+    kb.adjust(2, 2, 2, 2, 2, 2)
     return kb.as_markup()
 
 
@@ -20063,6 +20081,7 @@ async def admin_target_text(user_id: int):
         f"👤 <b>ИГРОК</b>\n\n"
         f"👤 Username: <b>{username}</b>\n"
         f"💰 Баланс: <b>{int(player['balance'] or 0):,} ₽</b>\n"
+        f"🪙 Коины: <b>{int(player['coins'] or 0):,}</b>\n"
         f"⭐ Уровень: <b>{player['level']}</b>\n"
         f"✨ XP: <b>{player['xp']}</b>\n"
         f"🚗 Машин в гараже: <b>{cars}</b>\n"
@@ -20102,6 +20121,74 @@ async def admin_home(call, state: FSMContext):
     await state.clear()
     await edit_text_safe(call, "🛡 <b>АДМИН-ПАНЕЛЬ</b>\n\nВыбери нужный раздел.", parse_mode="HTML", reply_markup=admin_keyboard())
     await safe_callback_answer()
+
+
+@dp.callback_query(F.data == "admin_reset_all")
+async def admin_reset_all_preview(call):
+    if not is_admin(call.from_user.id):
+        await safe_callback_answer(call, "⛔ Доступ запрещён.", show_alert=True)
+        return
+
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute("SELECT COUNT(*) FROM players")
+        player_count = int((await cur.fetchone())[0] or 0)
+        cur = await db.execute("SELECT COUNT(*) FROM garage")
+        car_count = int((await cur.fetchone())[0] or 0)
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Да, обнулить", callback_data="admin_reset_all_confirm")
+    kb.button(text="❌ Отмена", callback_data="admin_home")
+    kb.adjust(1)
+    text = (
+        "⚠️ <b>ПОЛНЫЙ СБРОС ПРОГРЕССА</b>\n\n"
+        f"👥 Игроков в базе: <b>{player_count:,}</b>\n"
+        f"🚗 Машин в гаражах будет удалено: <b>{car_count:,}</b>\n\n"
+        "У всех игроков рублёвый баланс и банковские накопления станут <b>0 ₽</b>, опыт — <b>0 XP</b>, уровень — <b>1</b>."
+        " Все автомобили из гаражей будут удалены, активные объявления этих машин закроются.\n\n"
+        "🪙 Купленные коины будут <b>сохранены</b>. Номера, недвижимость и бизнесы эта кнопка не затрагивает.\n\n"
+        "Это действие необратимо. Подтверди сброс:"
+    )
+    await edit_text_safe(call, text, parse_mode="HTML", reply_markup=kb.as_markup())
+    await safe_callback_answer(call)
+
+
+@dp.callback_query(F.data == "admin_reset_all_confirm")
+async def admin_reset_all_confirm(call):
+    if not is_admin(call.from_user.id):
+        await safe_callback_answer(call, "⛔ Доступ запрещён.", show_alert=True)
+        return
+
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute("SELECT COUNT(*) FROM players")
+        player_count = int((await cur.fetchone())[0] or 0)
+        cur = await db.execute("SELECT COUNT(*) FROM garage")
+        car_count = int((await cur.fetchone())[0] or 0)
+        await db.execute("UPDATE players SET balance=0, xp=0, level=1")
+        await db.execute("UPDATE phone_bank SET savings=0, updated_at=CURRENT_TIMESTAMP")
+        await db.execute("UPDATE player_market_listings SET status='cancelled' WHERE status='active'")
+        await db.execute("UPDATE car_investments SET status='cancelled', sold_at=COALESCE(sold_at,CURRENT_TIMESTAMP) WHERE status='active'")
+        await db.execute("DELETE FROM garage")
+        await db.commit()
+
+    await admin_log(
+        call.from_user.id,
+        "reset_all_players",
+        amount=car_count,
+        details=f"players={player_count}; balance=0; bank_savings=0; xp=0; level=1; garage_cars_deleted={car_count}; active_car_listings_cancelled=1; active_investments_cancelled=1; coins_preserved=1",
+    )
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🔙 Админ-панель", callback_data="admin_home")
+    await edit_text_safe(
+        call,
+        "✅ <b>Сброс завершён</b>\n\n"
+        f"👥 Обработано игроков: <b>{player_count:,}</b>\n"
+        f"🚗 Удалено автомобилей из гаражей: <b>{car_count:,}</b>\n"
+        "💰 Баланс и банковские накопления: 0 ₽ · ⭐ Уровень: 1 · ✨ Опыт: 0 XP\n"
+        "🪙 Коины, номера, недвижимость и бизнесы сохранены.",
+        parse_mode="HTML",
+        reply_markup=kb.as_markup(),
+    )
+    await safe_callback_answer(call, "Сброс выполнен.", show_alert=True)
 
 
 @dp.callback_query(F.data == "admin_close")
@@ -20324,11 +20411,17 @@ async def admin_economy(call):
         admin_give = (await cur.fetchone())[0] or 0
         cur = await db.execute("SELECT COALESCE(SUM(amount),0) FROM admin_logs WHERE action='take'")
         admin_take = (await cur.fetchone())[0] or 0
+        cur = await db.execute("SELECT COALESCE(SUM(coins),0) FROM players")
+        coins_in_circulation = (await cur.fetchone())[0] or 0
+        cur = await db.execute("SELECT COALESCE(SUM(stars_amount),0) FROM coin_payments")
+        coins_stars_total = (await cur.fetchone())[0] or 0
     text = (
         "💰 <b>ЭКОНОМИКА</b>\n\n"
         f"💵 Денег у игроков: <b>{int(total):,} ₽</b>\n"
         f"📊 Средний баланс: <b>{int(avg):,} ₽</b>\n"
-        f"👑 Максимальный баланс: <b>{int(top_balance):,} ₽</b>\n\n"
+        f"👑 Максимальный баланс: <b>{int(top_balance):,} ₽</b>\n"
+        f"🪙 Коины у игроков: <b>{int(coins_in_circulation):,}</b>\n"
+        f"⭐ Оплачено Stars за коины: <b>{int(coins_stars_total):,} ⭐</b>\n\n"
         f"🛡 Выдано админами: <b>{int(admin_give):,} ₽</b>\n"
         f"🛡 Забрано админами: <b>{int(admin_take):,} ₽</b>"
     )
@@ -21080,6 +21173,165 @@ async def investment_sell(call):
     await safe_callback_answer(call, f"💰 Продано за {payout:,} ₽")
     await call.message.edit_text(f"💎 <b>ИНВЕСТИЦИЯ ЗАКРЫТА</b>\n\n🚗 {html.escape(str(car['car_name']))}\n📈 Доходность: <b>{pct:+.2f}%</b>\n💰 Получено: <b>{payout:,} ₽</b>", parse_mode="HTML", reply_markup=InlineKeyboardBuilder().button(text="🏠 Гараж", callback_data="garage").as_markup())
 
+
+
+# =========================================================
+# 🪙 КОИНЫ — ПОКУПКА ЗА TELEGRAM STARS
+# =========================================================
+# Пакеты можно менять здесь. Stars для цифровых товаров принимаются в XTR.
+COIN_PACKAGES = {
+    "mini": {"coins": 100, "stars": 25, "title": "Набор новичка"},
+    "popular": {"coins": 500, "stars": 100, "title": "Популярный набор"},
+    "pro": {"coins": 1200, "stars": 200, "title": "Продвинутый набор"},
+    "mega": {"coins": 3500, "stars": 500, "title": "Большой набор"},
+}
+
+
+def coins_shop_keyboard():
+    kb = InlineKeyboardBuilder()
+    for package_key, package in COIN_PACKAGES.items():
+        coin_label = f"{int(package['coins']):,}".replace(",", " ")
+        kb.button(
+            text=f"🪙 {coin_label} коинов — {package['stars']} ⭐",
+            callback_data=f"coins_buy:{package_key}",
+        )
+    kb.button(text="🔄 Обновить баланс", callback_data="coins_shop")
+    kb.button(text="🏠 Главное меню", callback_data="menu")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+async def coins_shop_text(user_id: int) -> str:
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute("SELECT COALESCE(coins,0) FROM players WHERE user_id=?", (user_id,))
+        row = await cur.fetchone()
+    balance = int(row[0] or 0) if row else 0
+    return (
+        "🪙 <b>МАГАЗИН КОИНОВ</b>\n\n"
+        f"Твой баланс: <b>{balance:,} коинов</b>\n\n".replace(",", " ")
+        + "Коины — отдельная игровая валюта. Выбери набор и оплати его Telegram Stars.\n"
+        "Коины зачисляются только после подтверждения успешного платежа Telegram.\n\n"
+        "📦 <b>Доступные наборы:</b>"
+    )
+
+
+@dp.message(F.text == "🪙 Коины")
+async def coins_shop_message(message: Message):
+    await create_player(message.from_user.id, message.from_user.username)
+    await message.answer(
+        await coins_shop_text(message.from_user.id),
+        parse_mode="HTML",
+        reply_markup=coins_shop_keyboard(),
+    )
+
+
+@dp.callback_query(F.data == "coins_shop")
+async def coins_shop_callback(call):
+    await create_player(call.from_user.id, call.from_user.username)
+    await edit_text_safe(
+        call,
+        await coins_shop_text(call.from_user.id),
+        parse_mode="HTML",
+        reply_markup=coins_shop_keyboard(),
+    )
+    await safe_callback_answer(call)
+
+
+async def coins_create_invoice(user_id: int, package_key: str):
+    package = COIN_PACKAGES.get(package_key)
+    if not package:
+        return False, "❌ Такой набор коинов не найден."
+    if bot is None:
+        return False, "❌ Платежи недоступны: у бота не настроен токен."
+    await create_player(user_id)
+    payload = f"coins:{package_key}:{int(user_id)}"
+    await bot.send_invoice(
+        chat_id=user_id,
+        title=f"{package['coins']} коинов",
+        description=f"{package['title']}: {package['coins']} коинов за {package['stars']} Telegram Stars.",
+        payload=payload,
+        currency="XTR",
+        prices=[LabeledPrice(label=f"{package['coins']} коинов", amount=int(package["stars"]))],
+        provider_token="",
+    )
+    return True, f"💳 Счёт на {package['stars']} ⭐ отправлен. Коины поступят после оплаты."
+
+
+@dp.callback_query(F.data.startswith("coins_buy:"))
+async def coins_buy_callback(call):
+    package_key = call.data.split(":", 1)[1]
+    try:
+        ok, result_text = await coins_create_invoice(call.from_user.id, package_key)
+    except Exception as exc:
+        print(f"⚠️ Не удалось выставить счёт на коины: {exc}")
+        ok, result_text = False, "❌ Не удалось создать счёт. Попробуй ещё раз позже."
+    await safe_callback_answer(call, result_text, show_alert=not ok)
+
+
+async def coins_apply_successful_payment(user_id: int, payment):
+    """Проверяет платёж, защищает от повторного начисления и фиксирует charge ID."""
+    payload = str(payment.invoice_payload or "")
+    parts = payload.split(":")
+    if len(parts) != 3 or parts[0] != "coins":
+        return False, "❌ Некорректный платёж коинов.", True
+    package_key = parts[1]
+    package = COIN_PACKAGES.get(package_key)
+    if not package:
+        return False, "❌ Набор коинов из счёта больше не существует.", True
+    try:
+        payload_user_id = int(parts[2])
+    except (TypeError, ValueError):
+        return False, "❌ Некорректный пользователь в платеже.", True
+    if payload_user_id != int(user_id):
+        return False, "❌ Этот платёж принадлежит другому пользователю.", True
+    if str(payment.currency) != "XTR":
+        return False, "❌ Валюта платежа не совпадает с Telegram Stars.", True
+    if int(payment.total_amount or 0) != int(package["stars"]):
+        return False, "❌ Сумма платежа не совпадает с выбранным набором.", True
+    charge_id = str(payment.telegram_payment_charge_id or "")
+    if not charge_id:
+        return False, "❌ В платеже отсутствует ID операции.", True
+
+    await create_player(user_id)
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "SELECT 1 FROM coin_payments WHERE telegram_payment_charge_id=?",
+            (charge_id,),
+        )
+        if await cur.fetchone():
+            return True, "✅ Этот платёж уже обработан — коины повторно не начислялись.", False
+
+        cur = await db.execute(
+            """INSERT OR IGNORE INTO coin_payments
+               (telegram_payment_charge_id,user_id,package_key,coins_amount,stars_amount,payload)
+               VALUES(?,?,?,?,?,?)""",
+            (charge_id, user_id, package_key, int(package["coins"]), int(package["stars"]), payload),
+        )
+        if cur.rowcount != 1:
+            await db.commit()
+            return True, "✅ Этот платёж уже обработан — коины повторно не начислялись.", False
+
+        cur = await db.execute(
+            "UPDATE players SET coins=COALESCE(coins,0)+? WHERE user_id=?",
+            (int(package["coins"]), user_id),
+        )
+        if cur.rowcount != 1:
+            await db.rollback()
+            return False, "❌ Не удалось зачислить коины. Платёж будет возвращён автоматически.", True
+        await db.commit()
+
+    coin_label = f"{int(package['coins']):,}".replace(",", " ")
+    return True, f"✅ Оплата прошла! Начислено <b>{coin_label} коинов</b>.", False
+
+
+@dp.message(Command("paysupport"))
+async def coin_payment_support(message: Message):
+    await message.answer(
+        "🆘 <b>Поддержка платежей</b>\n\n"
+        "Если коины не поступили после оплаты, сохрани квитанцию Telegram и обратись к администрации бота. "
+        "Укажи дату, сумму в ⭐ и название купленного набора. Не отправляй никому пароли и коды входа.",
+        parse_mode="HTML",
+    )
 
 
 # =========================================================
@@ -22498,6 +22750,25 @@ async def battle_pass_premium_buy_callback(call):
 @dp.pre_checkout_query()
 async def battle_pass_pre_checkout(query: PreCheckoutQuery):
     payload = str(query.invoice_payload or "")
+    if payload.startswith("coins:"):
+        parts = payload.split(":")
+        try:
+            valid_coin_invoice = (
+                len(parts) == 3
+                and parts[0] == "coins"
+                and parts[1] in COIN_PACKAGES
+                and int(parts[2]) == int(query.from_user.id)
+                and str(query.currency) == "XTR"
+                and int(query.total_amount or 0) == int(COIN_PACKAGES[parts[1]]["stars"])
+            )
+        except (TypeError, ValueError):
+            valid_coin_invoice = False
+        if valid_coin_invoice:
+            await query.answer(ok=True)
+        else:
+            await query.answer(ok=False, error_message="Некорректный счёт на коины.")
+        return
+
     parts = payload.split(":")
     valid_payload = False
     valid_amount = int(query.total_amount or 0) == BP_PREMIUM_PRICE_STARS
@@ -22522,6 +22793,26 @@ async def battle_pass_pre_checkout(query: PreCheckoutQuery):
 @dp.message(F.successful_payment)
 async def battle_pass_successful_payment(message: Message):
     payment = message.successful_payment
+    if str(payment.invoice_payload or "").startswith("coins:"):
+        ok, result_text, should_refund = await coins_apply_successful_payment(message.from_user.id, payment)
+        if not ok:
+            if should_refund:
+                try:
+                    await bot.refund_star_payment(
+                        user_id=message.from_user.id,
+                        telegram_payment_charge_id=str(payment.telegram_payment_charge_id),
+                    )
+                except Exception as exc:
+                    print(f"⚠️ Не удалось автоматически вернуть некорректный платёж коинов: {exc}")
+            await message.answer(result_text, parse_mode="HTML")
+            return
+        await message.answer(
+            result_text + "\n\n🪙 Баланс можно проверить в разделе «Коины».",
+            parse_mode="HTML",
+            reply_markup=coins_shop_keyboard(),
+        )
+        return
+
     ok, result_text, refunded = await bp_activate_premium_from_payment(message.from_user.id, payment)
     if not ok:
         try:
