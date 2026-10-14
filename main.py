@@ -5324,7 +5324,7 @@ async def show_market(call, city, seed, index, replace=False):
         index
     )
 
-    if not photo_path.exists():
+    if not photo_path or not photo_path.exists():
 
         await edit_text_safe(
             call,
