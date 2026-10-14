@@ -21,7 +21,9 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 
-TOKEN = os.getenv("BOT_TOKEN", "8066402296:AAEc2i_8PzhgEWCQpbj-wM55G-ay74HczC8").strip()
+# Укажи свежий токен через переменную окружения BOT_TOKEN в настройках хостинга.
+# Не храни токен внутри исходного кода.
+TOKEN = os.getenv("BOT_TOKEN", "").strip()
 DB = "game.db"
 
 # Администраторы задаются через переменную окружения ADMIN_IDS=123,456
@@ -3335,9 +3337,9 @@ async def nurburgring_open(call):
     )
     if award:
         w = award["winner"]
-        text += (f"🎉 <b>Итоги {award["month"]}</b>\n"
-                 f"🥇 {html.escape(str(w["username"]))} — {format_nurburgring_time(w["lap_time"])}\n"
-                 f"💰 Выплачено: <b>{award["prize"]:,} ₽</b> + 500 XP\n\n")
+        text += (f"🎉 <b>Итоги {award['month']}</b>\n"
+                 f"🥇 {html.escape(str(w['username']))} — {format_nurburgring_time(w['lap_time'])}\n"
+                 f"💰 Выплачено: <b>{award['prize']:,} ₽</b> + 500 XP\n\n")
     text += "🏆 <b>ТОП-10 МЕСЯЦА</b>\n\n"
     if not rows:
         text += "Пока никто не установил результат.\n"
