@@ -254,6 +254,66 @@ CARS = [
 
 
 # =========================================================
+# 💎 АВТОМОБИЛИ ОГРАНИЧЕННОГО ТИРАЖА
+# =========================================================
+# Тираж хранится в SQLite и не восстанавливается при перезапуске бота.
+# Каждый проданный экземпляр получает постоянный серийный номер.
+LIMITED_CARS = [
+    {
+        "key": "skyline_r34_nur",
+        "name": "Nissan Skyline GT-R R34 V-Spec II Nür",
+        "year": 2002,
+        "power": 500,
+        "price": 12_000_000,
+        "stock": 25,
+        "description": "Редкая версия легендарного Skyline с атмосферой японской эпохи JDM.",
+        "perk": "Коллекционная серия: особая отметка в гараже и уникальный серийный номер.",
+    },
+    {
+        "key": "bmw_m3_gtr_e46",
+        "name": "BMW M3 GTR E46 Street",
+        "year": 2001,
+        "power": 350,
+        "price": 20_000_000,
+        "stock": 15,
+        "description": "Редкая дорожная версия гоночной легенды BMW M3 GTR.",
+        "perk": "Коллекционная серия: особая отметка в гараже и уникальный серийный номер.",
+    },
+    {
+        "key": "mercedes_clk_gtr",
+        "name": "Mercedes-Benz CLK GTR",
+        "year": 1998,
+        "power": 612,
+        "price": 65_000_000,
+        "stock": 5,
+        "description": "Экстремальный омологационный суперкар, выпущенный в очень малом количестве.",
+        "perk": "Ультраредкий тираж: всего пять игровых экземпляров.",
+    },
+    {
+        "key": "porsche_gt2_rs_clubsport",
+        "name": "Porsche 911 GT2 RS Clubsport",
+        "year": 2019,
+        "power": 700,
+        "price": 28_000_000,
+        "stock": 12,
+        "description": "Трековая версия GT2 RS для коллекционеров и любителей автоспорта.",
+        "perk": "Коллекционная серия: особая отметка в гараже и уникальный серийный номер.",
+    },
+    {
+        "key": "aventador_svj_63",
+        "name": "Lamborghini Aventador SVJ 63",
+        "year": 2019,
+        "power": 770,
+        "price": 80_000_000,
+        "stock": 7,
+        "description": "Особая серия SVJ с эксклюзивным оформлением и редким статусом.",
+        "perk": "Сверхредкая серия: всего семь игровых экземпляров.",
+    },
+]
+LIMITED_CARS_BY_KEY = {car["key"]: car for car in LIMITED_CARS}
+
+
+# =========================================================
 # ИМПОРТ АВТОМОБИЛЕЙ
 # =========================================================
 
@@ -1208,6 +1268,11 @@ async def init_db():
         # Дополнительные поля для системы «Машины с историей»
         cursor = await db.execute("PRAGMA table_info(garage)")
         garage_columns = [row[1] for row in await cursor.fetchall()]
+
+        if "limited_car_key" not in garage_columns:
+            await db.execute("ALTER TABLE garage ADD COLUMN limited_car_key TEXT")
+        if "limited_number" not in garage_columns:
+            await db.execute("ALTER TABLE garage ADD COLUMN limited_number TEXT")
 
         if "history_type" not in garage_columns:
             await db.execute("ALTER TABLE garage ADD COLUMN history_type TEXT DEFAULT 'normal'")
@@ -2464,6 +2529,46 @@ async def init_db():
                 PRIMARY KEY(user_id, item_key)
             )
         """)
+
+        # Ограниченный тираж: запас и журнал выдачи серийных номеров.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS limited_edition_stock (
+                car_key TEXT PRIMARY KEY,
+                car_name TEXT NOT NULL,
+                year INTEGER NOT NULL,
+                power INTEGER NOT NULL,
+                price INTEGER NOT NULL,
+                total_stock INTEGER NOT NULL CHECK(total_stock >= 0),
+                remaining_stock INTEGER NOT NULL CHECK(remaining_stock >= 0),
+                description TEXT NOT NULL DEFAULT '',
+                perk TEXT NOT NULL DEFAULT '',
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS limited_edition_sales (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                car_key TEXT NOT NULL,
+                user_id INTEGER NOT NULL,
+                garage_car_id INTEGER NOT NULL,
+                serial_no INTEGER NOT NULL,
+                sale_price INTEGER NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(car_key, serial_no)
+            )
+        """)
+        for limited_car in LIMITED_CARS:
+            await db.execute(
+                """INSERT OR IGNORE INTO limited_edition_stock
+                   (car_key, car_name, year, power, price, total_stock, remaining_stock, description, perk, active)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)""",
+                (
+                    limited_car["key"], limited_car["name"], limited_car["year"],
+                    limited_car["power"], limited_car["price"], limited_car["stock"],
+                    limited_car["stock"], limited_car["description"], limited_car["perk"],
+                ),
+            )
 
         await db.commit()
 
@@ -8364,6 +8469,7 @@ async def show_court_list(call):
 def market_main_keyboard():
     kb = InlineKeyboardBuilder()
     kb.button(text="🏙 Города", callback_data="market_cities")
+    kb.button(text="💎 Лимитированные авто", callback_data="limited_catalog")
     kb.button(text="🏷 Рынок номеров", callback_data="plate_market")
     kb.button(text="🌑 Серый рынок", callback_data="grey_market_new")
     kb.button(text="⚖️ Суд", callback_data="court_list")
@@ -9475,7 +9581,7 @@ async def get_garage_rows(user_id):
                    g.restoration_stage, g.originality_score, g.certificate_issued,
                    g.mileage, g.condition, g.engine_condition, g.gearbox_condition, g.suspension_condition,
                    g.brakes_condition, g.tires_condition, g.fluids_condition, g.last_drive_at,
-                   g.last_maintenance_at, g.maintenance_spend
+                   g.last_maintenance_at, g.maintenance_spend, g.limited_car_key, g.limited_number
             FROM garage g
             LEFT JOIN plates p ON p.id = g.plate_id
             WHERE g.user_id = ?
@@ -9497,6 +9603,20 @@ def get_car_template(name, buy_price=0, repair_cost=0):
         return None
 
     normalized = " ".join(str(name).strip().split()).casefold()
+
+    for limited_car in LIMITED_CARS:
+        if " ".join(str(limited_car["name"]).strip().split()).casefold() == normalized:
+            price = int(limited_car["price"])
+            return {
+                "name": limited_car["name"],
+                "year": limited_car["year"],
+                "photo": "",
+                "min": int(price * 0.85),
+                "max": int(price * 1.30),
+                "repair": 0,
+                "sell_bonus": 1.20,
+                "limited": True,
+            }
 
     for car in CARS:
         car_name = " ".join(str(car["name"]).strip().split()).casefold()
@@ -9604,6 +9724,8 @@ def build_garage_car(row):
         "last_drive_at": row["last_drive_at"],
         "last_maintenance_at": row["last_maintenance_at"],
         "maintenance_spend": int(row["maintenance_spend"] or 0),
+        "limited_car_key": row["limited_car_key"],
+        "limited_number": row["limited_number"],
         "legacy": car.get("legacy", False),
     }
 
@@ -9825,6 +9947,13 @@ def build_garage_caption(car, index, total):
     registration = "✅ Зарегистрирована" if car.get("registered") else "🪪 Не зарегистрирована"
     history_mark = " 🔥" if car["history_type"] != "normal" else ""
     paparazzi_mark = " 📸" if paparazzi_is_active(car.get("paparazzi_until")) else ""
+    limited_mark = " 💎" if car.get("limited_car_key") else ""
+    limited_text = ""
+    if car.get("limited_car_key"):
+        limited_text = (
+            "💎 <b>АВТОМОБИЛЬ ОГРАНИЧЕННОГО ТИРАЖА</b>\n"
+            f"🏷 Серийный номер: <b>{html.escape(str(car.get('limited_number') or '—'))}</b>\n"
+        )
     tuning = constructor_summary(car)
     pts_block = (
         f"📜 ПТС: <b>{car.get('vin') or 'создаётся при открытии ПТС'}</b>\n"
@@ -9835,9 +9964,10 @@ def build_garage_caption(car, index, total):
     return (
         "🏠 <b>ТВОЙ ГАРАЖ</b>\n"
         f"🚗 Автомобиль <b>{index + 1}/{total}</b>\n\n"
-        f"🚘 <b>{car['name']}{history_mark}{paparazzi_mark}</b>\n"
+        f"🚘 <b>{car['name']}{history_mark}{paparazzi_mark}{limited_mark}</b>\n"
         f"📅 Год: <b>{car['year']}</b>\n"
         f"{pts_block}"
+        f"{limited_text}"
         f"👥 Владельцев: <b>{car.get('owner_count') or 1}</b>\n"
         f"📊 Рынок: <b>{car['min']:,} — {car['max']:,} ₽</b>\n"
         f"🔧 Ремонт: <b>{car['repair_cost']:,} ₽</b>\n"
@@ -12768,6 +12898,218 @@ async def social_find_enter(message:Message,state:FSMContext):
     await send_public_player(int(row['user_id']),message.from_user.id,destination=message)
 
 # =========================================================
+# 💎 МАГАЗИН АВТОМОБИЛЕЙ ОГРАНИЧЕННОГО ТИРАЖА
+# =========================================================
+
+def limited_catalog_keyboard(rows):
+    kb = InlineKeyboardBuilder()
+    for row in rows:
+        remaining = int(row["remaining_stock"] or 0)
+        total = int(row["total_stock"] or 0)
+        symbol = "💎" if remaining else "🔒"
+        kb.button(
+            text=f"{symbol} {row['car_name']} · {remaining}/{total}",
+            callback_data=f"limited_view:{row['car_key']}",
+        )
+    kb.button(text="🔄 Обновить", callback_data="limited_catalog")
+    kb.button(text="🔙 Рынок", callback_data="market")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+async def limited_stock_row(car_key):
+    async with aiosqlite.connect(DB) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT * FROM limited_edition_stock WHERE car_key=? AND active=1",
+            (car_key,),
+        )
+        return await cur.fetchone()
+
+
+@dp.callback_query(F.data == "limited_catalog")
+async def limited_catalog(call):
+    async with aiosqlite.connect(DB) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT * FROM limited_edition_stock WHERE active=1 ORDER BY price ASC, car_name ASC"
+        )
+        rows = await cur.fetchall()
+
+    if not rows:
+        text = "💎 <b>ЛИМИТИРОВАННЫЕ АВТО</b>\n\nСейчас нет доступных моделей. Загляни позже."
+    else:
+        lines = [
+            "💎 <b>ЛИМИТИРОВАННЫЕ АВТО</b>",
+            "У каждой модели фиксированный тираж. Распроданные экземпляры автоматически не появляются снова.\n",
+        ]
+        for row in rows:
+            left = int(row["remaining_stock"] or 0)
+            total = int(row["total_stock"] or 0)
+            status = "✅ В продаже" if left > 0 else "🔒 Тираж распродан"
+            lines.append(
+                f"🚘 <b>{html.escape(row['car_name'])}</b>\n"
+                f"📅 {row['year']} г. · ⚡ {row['power']} л.с.\n"
+                f"💰 Цена: <b>{int(row['price']):,} ₽</b>\n"
+                f"📦 Осталось: <b>{left}/{total}</b> · {status}\n"
+            )
+        text = "\n".join(lines)
+
+    await edit_text_safe(call, text, parse_mode="HTML", reply_markup=limited_catalog_keyboard(rows))
+    await safe_callback_answer(call)
+
+
+@dp.callback_query(F.data.startswith("limited_view:"))
+async def limited_view(call):
+    car_key = call.data.split(":", 1)[1].strip()
+    if car_key not in LIMITED_CARS_BY_KEY:
+        await safe_callback_answer(call, "❌ Эта модель не найдена.", show_alert=True)
+        return
+
+    row = await limited_stock_row(car_key)
+    if not row:
+        await safe_callback_answer(call, "❌ Эта модель больше недоступна.", show_alert=True)
+        return
+
+    remaining = int(row["remaining_stock"] or 0)
+    total = int(row["total_stock"] or 0)
+    kb = InlineKeyboardBuilder()
+    if remaining > 0:
+        kb.button(text=f"🛒 Купить за {int(row['price']):,} ₽", callback_data=f"limited_buy:{car_key}")
+    else:
+        kb.button(text="🔒 Тираж распродан", callback_data="limited_catalog")
+    kb.button(text="🔄 Обновить", callback_data=f"limited_view:{car_key}")
+    kb.button(text="🔙 К лимитированным авто", callback_data="limited_catalog")
+    kb.adjust(1)
+
+    text = (
+        "💎 <b>АВТОМОБИЛЬ ОГРАНИЧЕННОГО ТИРАЖА</b>\n\n"
+        f"🚘 <b>{html.escape(row['car_name'])}</b>\n"
+        f"📅 Год выпуска: <b>{int(row['year'])}</b>\n"
+        f"⚡ Мощность: <b>{int(row['power'])} л.с.</b>\n"
+        f"💰 Стоимость: <b>{int(row['price']):,} ₽</b>\n"
+        f"📦 Доступно: <b>{remaining} из {total}</b>\n"
+        f"🏷 Серийный номер после покупки: будет присвоен автоматически\n\n"
+        f"{html.escape(row['description'])}\n\n"
+        f"✨ <b>Особенность:</b> {html.escape(row['perk'])}\n\n"
+        "⚠️ Покупка окончательная: экземпляр вычитается из общего серверного тиража."
+    )
+    await edit_text_safe(call, text, parse_mode="HTML", reply_markup=kb.as_markup())
+    await safe_callback_answer(call)
+
+
+@dp.callback_query(F.data.startswith("limited_buy:"))
+async def limited_buy(call):
+    car_key = call.data.split(":", 1)[1].strip()
+    if car_key not in LIMITED_CARS_BY_KEY:
+        await safe_callback_answer(call, "❌ Некорректная модель.", show_alert=True)
+        return
+
+    await create_player(call.from_user.id, call.from_user.username)
+    failure = None
+    purchase = None
+
+    # BEGIN IMMEDIATE сериализует покупки: два игрока не смогут купить один последний экземпляр.
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT * FROM limited_edition_stock WHERE car_key=? AND active=1",
+            (car_key,),
+        )
+        stock = await cur.fetchone()
+        if not stock:
+            failure = "Эта модель не найдена."
+        elif int(stock["remaining_stock"] or 0) <= 0:
+            failure = "Тираж уже полностью распродан."
+        else:
+            price = int(stock["price"])
+            cur = await db.execute("SELECT balance FROM players WHERE user_id=?", (call.from_user.id,))
+            player = await cur.fetchone()
+            balance = int(player["balance"] or 0) if player else 0
+            if balance < price:
+                failure = f"Не хватает {price - balance:,} ₽ для покупки."
+            else:
+                cur = await db.execute(
+                    "UPDATE players SET balance=balance-? WHERE user_id=? AND balance>=?",
+                    (price, call.from_user.id, price),
+                )
+                if cur.rowcount != 1:
+                    failure = "Не удалось списать деньги. Обнови баланс и попробуй ещё раз."
+                else:
+                    cur = await db.execute(
+                        "UPDATE limited_edition_stock SET remaining_stock=remaining_stock-1 "
+                        "WHERE car_key=? AND remaining_stock>0",
+                        (car_key,),
+                    )
+                    if cur.rowcount != 1:
+                        failure = "Кто-то только что купил последний экземпляр. Деньги не списаны."
+                    else:
+                        cur = await db.execute(
+                            "SELECT COALESCE(MAX(serial_no), 0)+1 FROM limited_edition_sales WHERE car_key=?",
+                            (car_key,),
+                        )
+                        serial_no = int((await cur.fetchone())[0])
+                        total_stock = int(stock["total_stock"] or 0)
+                        serial_text = f"{serial_no:03d}/{total_stock:03d}"
+                        cur = await db.execute(
+                            """INSERT INTO garage
+                               (user_id, car_name, buy_price, repair_cost, repaired, history_type,
+                                history_multiplier, purchased_at, original_buy_price, original_purchased_at,
+                                owner_count, origin_country, current_country, current_city,
+                                limited_car_key, limited_number)
+                               VALUES (?, ?, ?, 0, 1, 'limited_edition', 1.65, CURRENT_TIMESTAMP,
+                                       ?, CURRENT_TIMESTAMP, 1, 'Лимитированная серия', 'Россия', 'Москва', ?, ?)""",
+                            (call.from_user.id, stock["car_name"], price, price, car_key, serial_text),
+                        )
+                        garage_car_id = int(cur.lastrowid)
+                        await db.execute(
+                            """INSERT INTO limited_edition_sales
+                               (car_key, user_id, garage_car_id, serial_no, sale_price)
+                               VALUES (?, ?, ?, ?, ?)""",
+                            (car_key, call.from_user.id, garage_car_id, serial_no, price),
+                        )
+                        cur = await db.execute(
+                            "SELECT remaining_stock FROM limited_edition_stock WHERE car_key=?",
+                            (car_key,),
+                        )
+                        remaining_after = int((await cur.fetchone())[0])
+                        await db.commit()
+                        purchase = {
+                            "name": str(stock["car_name"]),
+                            "price": price,
+                            "year": int(stock["year"]),
+                            "power": int(stock["power"]),
+                            "serial": serial_text,
+                            "remaining": remaining_after,
+                            "total": total_stock,
+                        }
+        if failure:
+            await db.rollback()
+
+    if failure:
+        await safe_callback_answer(call, f"❌ {failure}", show_alert=True)
+        return
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="💎 Каталог лимитированных авто", callback_data="limited_catalog")
+    kb.button(text="🏠 Мой гараж", callback_data="garage")
+    kb.button(text="🚗 Рынок", callback_data="market")
+    kb.adjust(1)
+    text = (
+        "✅ <b>ЛИМИТИРОВАННЫЙ АВТОМОБИЛЬ КУПЛЕН!</b>\n\n"
+        f"🚘 <b>{html.escape(purchase['name'])}</b>\n"
+        f"📅 Год: <b>{purchase['year']}</b> · ⚡ {purchase['power']} л.с.\n"
+        f"💰 Оплачено: <b>{purchase['price']:,} ₽</b>\n"
+        f"🏷 Твой серийный номер: <b>{purchase['serial']}</b>\n"
+        f"📦 Остаток тиража: <b>{purchase['remaining']}/{purchase['total']}</b>\n\n"
+        "💎 Машина добавлена в гараж. Серийный номер сохранится после перезапуска бота."
+    )
+    await edit_text_safe(call, text, parse_mode="HTML", reply_markup=kb.as_markup())
+    await safe_callback_answer(call, "Покупка успешна!")
+
+
+# =========================================================
 # РЫНОК
 # =========================================================
 
@@ -12777,6 +13119,7 @@ async def market(call):
         call,
         "🚗 <b>РЫНОК</b>\n\n"
         "🚘 <b>Рынок автомобилей</b> — города и объявления.\n"
+        "💎 <b>Лимитированные авто</b> — модели с фиксированным тиражом и уникальными серийными номерами.\n"
         "🌑 <b>Серый рынок</b> — очень дешёвые лоты и высокий риск.\n"
         "🏷 <b>Рынок номеров</b> — купля и продажа номеров.\n"
         "📣 <b>Рынок игроков</b> — автомобили от игроков.\n"
